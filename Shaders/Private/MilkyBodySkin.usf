@@ -1,0 +1,108 @@
+// MilkyBody Linear Blend Skinning Compute Shader
+// Produces skinned positions for a SkeletalMesh section into an intermediate buffer.
+// The engine's GPU Skin Cache is bypassed in MeshDeformer mode, so MilkyBody must
+// perform skinning itself before layering PBD on top.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/GpuSkinCommon.ush"
+
+// Static (ref pose) vertex positions — whole-LOD, packed float3 as 3 consecutive floats.
+Buffer<float> StaticPositions;
+
+// Per-section bone matrices (3 float4 rows per bone).
+Buffer<float4> BoneMatrices;
+
+// Skin weight stream + optional UBI lookup stream.
+Buffer<uint> InputWeightStream;
+Buffer<uint> InputWeightLookupStream;
+
+// Output: intermediate skinned positions (whole LOD, same layout as StaticPositions).
+RWBuffer<float> OutSkinnedPositions;
+
+uint NumVertices;
+uint NumBoneInfluences;
+uint InputWeightStride;
+uint InputWeightIndexSize;
+uint SectionVertexOffset;
+uint SectionNumVertices;
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 64
+#endif
+
+float3 LoadPackedFloat3(Buffer<float> InBuffer, uint VertexIndex)
+{
+	uint Offset = VertexIndex * 3;
+	return float3(InBuffer[Offset + 0], InBuffer[Offset + 1], InBuffer[Offset + 2]);
+}
+
+void StorePackedFloat3(RWBuffer<float> InBuffer, uint VertexIndex, float3 Value)
+{
+	uint Offset = VertexIndex * 3;
+	InBuffer[Offset + 0] = Value.x;
+	InBuffer[Offset + 1] = Value.y;
+	InBuffer[Offset + 2] = Value.z;
+}
+
+// Returns the 4x3 (row-major) bone matrix for the given LOD-global vertex,
+// blended by its skin weights. Mirrors Optimus DataInterfaceSkeletonCommon.ush.
+// The skin weight buffer is LOD-wide (shared across sections), but BoneMatrices
+// is per-section and bone indices in the weight stream are section-local.
+float3x4 ComputeWeightedBoneMatrix(uint VertexIndex)
+{
+#if !ENABLE_DEFORMER_BONES
+	return float3x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0);
+#elif GPUSKIN_UNLIMITED_BONE_INFLUENCE
+	const uint BlendOffsetCount = InputWeightLookupStream[VertexIndex];
+	return ComputeBoneMatrixWithUnlimitedInfluences(BoneMatrices, InputWeightStream, InputWeightIndexSize, BlendOffsetCount);
+#else
+	const uint StreamOffset = (VertexIndex * (InputWeightStride / 4));
+	const uint NumInfluences = NumBoneInfluences;
+
+	FGPUSkinIndexAndWeight IndicesAndWeights = (FGPUSkinIndexAndWeight)0;
+	if (NumInfluences > 0)
+	{
+		IndicesAndWeights.BlendIndices  = GetBlendIndices(InputWeightStream, StreamOffset, 0);
+		IndicesAndWeights.BlendWeights  = GetBlendWeights(InputWeightStream, StreamOffset, 0, NumInfluences);
+	}
+	if (NumInfluences > 4)
+	{
+		IndicesAndWeights.BlendIndices2 = GetBlendIndices(InputWeightStream, StreamOffset, 1);
+		IndicesAndWeights.BlendWeights2 = GetBlendWeights(InputWeightStream, StreamOffset, 1, NumInfluences);
+	}
+	return ComputeBoneMatrixWithLimitedInfluences(BoneMatrices, IndicesAndWeights, NumInfluences > 4);
+#endif
+}
+
+float4 PushPosAndRadius;
+float4 PushImpulse;
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint SectionVertexIndex = DTid.x;
+	if (SectionVertexIndex >= SectionNumVertices)
+	{
+		return;
+	}
+	const uint GlobalVertexIndex = SectionVertexOffset + SectionVertexIndex;
+
+	const float3 RefPos = LoadPackedFloat3(StaticPositions, GlobalVertexIndex);
+	const float3x4 BoneMatrix = ComputeWeightedBoneMatrix(GlobalVertexIndex);
+
+	float3 Skinned = mul(BoneMatrix, float4(RefPos, 1.0f));
+
+	if (PushPosAndRadius.w > 0.001f)
+	{
+		float Dist = distance(Skinned, PushPosAndRadius.xyz);
+		if (Dist < PushPosAndRadius.w)
+		{
+			float Fall = 1.0f - saturate(Dist / PushPosAndRadius.w);
+			float Smooth = Fall * Fall * Fall * (Fall * (Fall * 6.0f - 15.0f) + 10.0f);
+			Skinned += PushImpulse.xyz * Smooth;
+		}
+	}
+
+	StorePackedFloat3(OutSkinnedPositions, GlobalVertexIndex, Skinned);
+}
