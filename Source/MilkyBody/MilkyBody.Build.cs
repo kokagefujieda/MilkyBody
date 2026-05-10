@@ -20,6 +20,8 @@ public class MilkyBody : ModuleRules
 			"CoreUObject",
 			"RHI",
 			"Renderer",
+			"Slate",
+			"SlateCore",
 		});
 
 		// Register shader source directory

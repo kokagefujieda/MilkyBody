@@ -1,7 +1,15 @@
 // MilkyBody Linear Blend Skinning Compute Shader
-// Produces skinned positions for a SkeletalMesh section into an intermediate buffer.
-// The engine's GPU Skin Cache is bypassed in MeshDeformer mode, so MilkyBody must
-// perform skinning itself before layering PBD on top.
+// Produces skinned positions and a re-derived tangent basis for a SkeletalMesh
+// section into intermediate buffers. The engine's GPU Skin Cache is bypassed in
+// MeshDeformer mode, so MilkyBody must perform skinning itself before layering
+// the puni dent on top.
+//
+// Tangent re-derivation: the dent is a rank-1 deformation (displacement is
+// Imp * Smooth(d/R) along a single direction Imp), so its deformation gradient
+// is F = I + Imp ⊗ ∇Smooth. We update the per-vertex tangent basis with F (for
+// TangentX) and F⁻ᵀ (for TangentZ, the normal) using Sherman–Morrison, so the
+// concave region is shaded with normals that actually match the pushed-in
+// surface instead of the original convex ones.
 
 #include "/Engine/Public/Platform.ush"
 #include "/Engine/Private/Common.ush"
@@ -9,6 +17,10 @@
 
 // Static (ref pose) vertex positions — whole-LOD, packed float3 as 3 consecutive floats.
 Buffer<float> StaticPositions;
+
+// Static (ref pose) tangent basis — whole-LOD, 2 SNORM float4 per vertex
+// (TangentX at *2, TangentZ at *2+1). W of TangentZ carries the binormal sign.
+Buffer<SNORM float4> StaticTangents;
 
 // Per-section bone matrices (3 float4 rows per bone).
 Buffer<float4> BoneMatrices;
@@ -19,6 +31,9 @@ Buffer<uint> InputWeightLookupStream;
 
 // Output: intermediate skinned positions (whole LOD, same layout as StaticPositions).
 RWBuffer<float> OutSkinnedPositions;
+
+// Output: intermediate skinned tangent basis (whole LOD, same layout as StaticTangents).
+RWBuffer<SNORM float4> OutSkinnedTangents;
 
 uint NumVertices;
 uint NumBoneInfluences;
@@ -75,8 +90,21 @@ float3x4 ComputeWeightedBoneMatrix(uint VertexIndex)
 #endif
 }
 
-float4 PushPosAndRadius;
-float4 PushImpulse;
+// Multi-slot puni state. Up to MAX_PUNI_SLOTS dents apply per dispatch — the
+// existing single hold uses slot 0; kneading mode fills slots 0..N-1. Each
+// slot's displacement adds linearly into Skinned, and their tangent
+// corrections apply sequentially (Sherman–Morrison) — exact for one slot,
+// a small approximation for ≥2 (visually fine for ≤16 dents — 10 fingers).
+#define MAX_PUNI_SLOTS 16
+float4 PushPosAndRadius[MAX_PUNI_SLOTS];
+float4 PushImpulse[MAX_PUNI_SLOTS];
+uint NumActivePuniSlots;
+// Scales the position displacement only. Lower values shrink the geometric
+// cavity so Lumen / SSAO / contact-shadow have less concavity to darken.
+float GeometryDepthScale;
+// Scales the per-vertex normal tilt produced by the F⁻ᵀ correction. Lower
+// values remove the directional shading darkening on the dent walls.
+float ShadingDepthScale;
 
 [numthreads(THREADGROUP_SIZE, 1, 1)]
 void MainCS(uint3 DTid : SV_DispatchThreadID)
@@ -93,16 +121,66 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 
 	float3 Skinned = mul(BoneMatrix, float4(RefPos, 1.0f));
 
-	if (PushPosAndRadius.w > 0.001f)
+	// Skin the ref-pose tangent basis through the same bone matrix (rotation only).
+	const float4 LocalTangentX = TangentBias_SkinCache(StaticTangents[GlobalVertexIndex * 2 + GPUSKIN_RWBUFFER_OFFSET_TANGENT_X]);
+	const float4 LocalTangentZ = TangentBias_SkinCache(StaticTangents[GlobalVertexIndex * 2 + GPUSKIN_RWBUFFER_OFFSET_TANGENT_Z]);
+	float3 TangentX = mul((float3x3)BoneMatrix, LocalTangentX.xyz);
+	float3 TangentZ = mul((float3x3)BoneMatrix, LocalTangentZ.xyz);
+
+	// Apply each active puni slot. Position displacement is purely additive;
+	// tangent corrections accumulate via sequential rank-1 updates.
+	const float EffectiveShadingScale = max(ShadingDepthScale, GeometryDepthScale);
+
+	[loop]
+	for (uint SlotIdx = 0; SlotIdx < NumActivePuniSlots; ++SlotIdx)
 	{
-		float Dist = distance(Skinned, PushPosAndRadius.xyz);
-		if (Dist < PushPosAndRadius.w)
+		const float4 PPR = PushPosAndRadius[SlotIdx];
+		const float4 PI  = PushImpulse[SlotIdx];
+		if (PPR.w <= 0.001f)
 		{
-			float Fall = 1.0f - saturate(Dist / PushPosAndRadius.w);
-			float Smooth = Fall * Fall * Fall * (Fall * (Fall * 6.0f - 15.0f) + 10.0f);
-			Skinned += PushImpulse.xyz * Smooth;
+			continue;
 		}
+
+		const float R = PPR.w;
+		const float3 Diff = Skinned - PPR.xyz;
+		const float Dist = length(Diff);
+		if (Dist >= R)
+		{
+			continue;
+		}
+
+		const float r = Dist / R;
+		const float Fall = 1.0f - r;
+		// Quintic smoothstep (Ken Perlin): f(t) = 6t^5 - 15t^4 + 10t^3
+		const float Smooth = Fall * Fall * Fall * (Fall * (Fall * 6.0f - 15.0f) + 10.0f);
+
+		// Position: push along this slot's impulse with smooth falloff and
+		// the asset's GeometryDepthScale.
+		Skinned += PI.xyz * (Smooth * GeometryDepthScale);
+
+		// ∇Smooth in component space; gradient of Dist w.r.t. position is the
+		// radial unit vector Diff/Dist.
+		const float DistSafe = max(Dist, 1e-6f);
+		const float dSmoothdd = -30.0f / R * Fall * Fall * r * r;
+		const float3 GradSmooth = dSmoothdd * (Diff / DistSafe);
+
+		// Sequential rank-1 update for the tangent basis (Sherman–Morrison).
+		// Both numerator AND denominator share the same scale factor; mixing
+		// shifts the Denom≈0 singularity and creates wave-shaped artifacts.
+		const float Denom = 1.0f + EffectiveShadingScale * dot(GradSmooth, PI.xyz);
+		const float SafeDenom = (abs(Denom) > 1e-4f) ? Denom : (Denom >= 0.0f ? 1e-4f : -1e-4f);
+
+		TangentX += PI.xyz * dot(GradSmooth, TangentX) * EffectiveShadingScale;
+		TangentZ -= GradSmooth * (dot(PI.xyz, TangentZ) * EffectiveShadingScale / SafeDenom);
 	}
 
+	TangentX = normalize(TangentX);
+	TangentZ = normalize(TangentZ);
+
 	StorePackedFloat3(OutSkinnedPositions, GlobalVertexIndex, Skinned);
+
+	OutSkinnedTangents[GlobalVertexIndex * 2 + GPUSKIN_RWBUFFER_OFFSET_TANGENT_X] =
+		TangentUnbias_SkinCache(float4(TangentX, LocalTangentX.w));
+	OutSkinnedTangents[GlobalVertexIndex * 2 + GPUSKIN_RWBUFFER_OFFSET_TANGENT_Z] =
+		TangentUnbias_SkinCache(float4(TangentZ, LocalTangentZ.w));
 }

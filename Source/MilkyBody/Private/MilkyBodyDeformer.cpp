@@ -1,16 +1,7 @@
 #include "MilkyBodyDeformer.h"
 #include "MilkyBodyDeformerInstance.h"
 
-UMilkyBodyDeformer::UMilkyBodyDeformer()
-{
-	VertexIndexStart = 0;
-	VertexIndexEnd = 0;
-	Stiffness = 0.8f;
-	Damping = 0.1f;
-	SolverIterations = 4;
-	AnimBlendPerFrame = 0.05f;
-	GlobalBlendWeight = 1.0f;
-}
+UMilkyBodyDeformer::UMilkyBodyDeformer() = default;
 
 UMeshDeformerInstanceSettings* UMilkyBodyDeformer::CreateSettingsInstance(
 	UMeshComponent* InMeshComponent)

@@ -30,13 +30,21 @@ public:
 		SHADER_PARAMETER(uint32, SectionVertexOffset)
 		SHADER_PARAMETER(uint32, SectionNumVertices)
 		SHADER_PARAMETER_SRV(Buffer<float>, StaticPositions)
+		SHADER_PARAMETER_SRV(Buffer<SNORM float4>, StaticTangents)
 		SHADER_PARAMETER_SRV(Buffer<float4>, BoneMatrices)
 		SHADER_PARAMETER_SRV(Buffer<uint>, InputWeightStream)
 		SHADER_PARAMETER_SRV(Buffer<uint>, InputWeightLookupStream)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutSkinnedPositions)
-		SHADER_PARAMETER(FVector4f, PushPosAndRadius)
-		SHADER_PARAMETER(FVector4f, PushImpulse)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<SNORM float4>, OutSkinnedTangents)
+		// Multi-slot puni state. Slot 0 = single hold; slots 0..N-1 = kneading / external multi-hold.
+		SHADER_PARAMETER_ARRAY(FVector4f, PushPosAndRadius, [16])
+		SHADER_PARAMETER_ARRAY(FVector4f, PushImpulse, [16])
+		SHADER_PARAMETER(uint32, NumActivePuniSlots)
+		SHADER_PARAMETER(float, GeometryDepthScale)
+		SHADER_PARAMETER(float, ShadingDepthScale)
 	END_SHADER_PARAMETER_STRUCT()
+
+	static constexpr int32 MaxPuniSlots = 16;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
