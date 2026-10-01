@@ -6,6 +6,10 @@
 #include "RHIUtilities.h"
 #include "RenderGraphResources.h"
 
+// Maximum number of simultaneous puni dents per dispatch. Shared with the
+// shader through the MAX_PUNI_SLOTS define so the two never drift apart.
+#define MILKYBODY_MAX_PUNI_SLOTS 32
+
 // Linear Blend Skinning compute shader.
 // Produces intermediate skinned positions (whole-LOD buffer) one section at a time.
 class FMilkyBodySkinCS : public FGlobalShader
@@ -15,6 +19,7 @@ class FMilkyBodySkinCS : public FGlobalShader
 
 public:
 	static constexpr uint32 ThreadGroupSize = 64;
+	static constexpr int32 MaxPuniSlots = MILKYBODY_MAX_PUNI_SLOTS;
 
 	class FEnableDeformerBones : SHADER_PERMUTATION_BOOL("ENABLE_DEFORMER_BONES");
 	class FUnlimitedBoneInfluence : SHADER_PERMUTATION_BOOL("GPUSKIN_UNLIMITED_BONE_INFLUENCE");
@@ -36,15 +41,26 @@ public:
 		SHADER_PARAMETER_SRV(Buffer<uint>, InputWeightLookupStream)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<float>, OutSkinnedPositions)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<SNORM float4>, OutSkinnedTangents)
-		// Multi-slot puni state. Slot 0 = single hold; slots 0..N-1 = kneading / external multi-hold.
-		SHADER_PARAMETER_ARRAY(FVector4f, PushPosAndRadius, [16])
-		SHADER_PARAMETER_ARRAY(FVector4f, PushImpulse, [16])
+		// Multi-slot puni state (component space). Hold / impulses / kneading /
+		// momi / external contacts are packed into slots 0..NumActivePuniSlots-1.
+		SHADER_PARAMETER_ARRAY(FVector4f, PushPosAndRadius, [MILKYBODY_MAX_PUNI_SLOTS])
+		SHADER_PARAMETER_ARRAY(FVector4f, PushImpulse, [MILKYBODY_MAX_PUNI_SLOTS])
 		SHADER_PARAMETER(uint32, NumActivePuniSlots)
 		SHADER_PARAMETER(float, GeometryDepthScale)
 		SHADER_PARAMETER(float, ShadingDepthScale)
+		// Deformation mask (softness). Per-bone softness is fed through the
+		// engine's weight-blend path as a fake bone-matrix buffer whose row0.w
+		// holds the softness, so Σ(weight × softness) falls out of the blend.
+		SHADER_PARAMETER(uint32, bUseBoneSoftness)
+		SHADER_PARAMETER(float, DefaultBoneSoftness)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float4>, SoftnessBoneMatrices)
+		// Optional vertex-color channel multiplied into the softness.
+		// Channel: 0 = off, 1 = R, 2 = G, 3 = B, 4 = A.
+		SHADER_PARAMETER_SRV(Buffer<float4>, VertexColors)
+		SHADER_PARAMETER(uint32, ColorIndexMask)
+		SHADER_PARAMETER(uint32, VertexColorMaskChannel)
+		SHADER_PARAMETER(uint32, bInvertVertexColorMask)
 	END_SHADER_PARAMETER_STRUCT()
-
-	static constexpr int32 MaxPuniSlots = 16;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
@@ -55,7 +71,6 @@ public:
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), ThreadGroupSize);
+		OutEnvironment.SetDefine(TEXT("MAX_PUNI_SLOTS"), MaxPuniSlots);
 	}
 };
-
-

@@ -6,6 +6,47 @@
 
 class UMilkyBodyDeformerInstance;
 
+/** 変形マスクに使う頂点カラーのチャンネル / Vertex-color channel used as a deformation mask. */
+UENUM(BlueprintType)
+enum class EMilkyBodyVertexColorChannel : uint8
+{
+	None  UMETA(DisplayName="None (unused)"),
+	Red   UMETA(DisplayName="R"),
+	Green UMETA(DisplayName="G"),
+	Blue  UMETA(DisplayName="B"),
+	Alpha UMETA(DisplayName="A"),
+};
+
+/**
+ * [日本語]
+ * ボーン単位の柔らかさ設定。頂点の柔らかさ = Σ(スキンウェイト × ボーンの柔らかさ)。
+ * 0 = まったく凹まない / 1 = フルに凹む。
+ *
+ * [English]
+ * Per-bone softness override. A vertex's softness is Σ(skin weight × bone softness).
+ * 0 = never dents, 1 = full dent.
+ */
+USTRUCT(BlueprintType)
+struct MILKYBODY_API FMilkyBodyBoneSoftness
+{
+	GENERATED_BODY()
+
+	/** 対象ボーン名 / Target bone name. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|Mask")
+	FName BoneName = NAME_None;
+
+	/** このボーンの柔らかさ (0–1) / Softness of this bone (0–1). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|Mask", meta=(ClampMin="0.0", ClampMax="1.0"))
+	float Softness = 0.0f;
+
+	/**
+	 * [日本語] 子孫ボーンにも同じ値を適用する。子孫に個別の設定があればそちらが優先。
+	 * [English] Also apply to all descendant bones. A descendant's own entry wins.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|Mask")
+	bool bIncludeChildren = true;
+};
+
 UCLASS(Blueprintable, BlueprintType, meta=(DisplayName="Milky Body Deformer"))
 class MILKYBODY_API UMilkyBodyDeformer : public UMeshDeformer
 {
@@ -19,11 +60,13 @@ public:
 	 * バネの硬さ (0.0–1.0)。プニのホールド開始/解放時のレスポンス速度を決めます。
 	 * 高いほど素早く凹み・素早く戻り、低いほどふわっとゆっくり追従します。
 	 * 内部で 2000 倍され、典型的なバネレートに換算されます。
+	 * 各接触（ホールド・指・揉みなど）がそれぞれ独立したバネを持ちます。
 	 *
 	 * [English]
 	 * Spring stiffness (0.0–1.0) driving the puni hold/release response.
 	 * Higher = snappy press and snap-back, lower = soft and delayed.
 	 * Internally multiplied by 2000 to span useful spring rates.
+	 * Every contact (hold, fingertip, kneading, …) has its own spring.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody",
 		meta=(ClampMin="0.0", ClampMax="1.0"))
@@ -33,12 +76,13 @@ public:
 	 * [日本語]
 	 * バネの減衰 (0.0–1.0)。ホールド開始キックや解放後の振動を抑えます。
 	 * 高いとオーバーシュートなく落ち着き、低いとぷるぷる揺れが残ります。
-	 * 内部で 200 倍されます。
+	 * 内部で 200 倍されます。0–1 の全範囲で安定します（240Hz サブステップ）。
 	 *
 	 * [English]
 	 * Spring damping (0.0–1.0) for the puni response.
 	 * Higher = settles without overshoot, lower = wobbles before settling.
-	 * Internally multiplied by 200.
+	 * Internally multiplied by 200. Stable across the whole 0–1 range
+	 * (integrated with 240 Hz sub-steps).
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody",
 		meta=(ClampMin="0.0", ClampMax="1.0"))
@@ -93,7 +137,7 @@ public:
 	 * 方向に合成変位し「ひっぱって動かしてる感」が出ます。
 	 *   0.0 → 引っ張りなし (アンカー位置で純粋な押し込みのみ)
 	 *   1.0 → 入力差分に即追従 (硬めの引っ張り)
-	 * 値は per-frame lerp の係数（固定 60Hz 内部ステップ）です。
+	 * 値は 60fps 換算の per-frame lerp 係数です（実際のフレームレートに合わせて自動換算）。
 	 *
 	 * [English]
 	 * Drag-follow smoothing (0.0–1.0). The hold's anchor stays fixed; the diff
@@ -104,7 +148,7 @@ public:
 	 * effect rather than the dent sliding.
 	 *   0.0 → no drag (anchored push only)
 	 *   1.0 → drag tracks the input instantly (stiff pull)
-	 * Per-frame lerp coefficient at the fixed 60 Hz internal step.
+	 * Per-frame lerp coefficient at 60 fps (converted to the actual frame rate).
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody",
 		meta=(ClampMin="0.0", ClampMax="1.0"))
@@ -127,15 +171,67 @@ public:
 
 	/**
 	 * [日本語]
-	 * 現在のプニ押し込み中心と半径をシアンのワイヤースフィアで描画します。
-	 * 当たり判定や半径の調整時の確認用です。
+	 * 現在のプニ押し込み中心と半径をワイヤースフィアで描画します。
+	 * 色: ホールド=シアン / ApplyPuni=黄 / こね=マゼンタ / 揉み=オレンジ / 指=緑。
+	 * コンソール変数 milkybody.DebugDraw 1 でも強制 ON にできます。
 	 *
 	 * [English]
-	 * Draws the current puni push center and radius as a cyan debug wire-sphere.
-	 * Useful while tuning hit-test placement and radius.
+	 * Draws every active puni center and radius as a debug wire-sphere.
+	 * Colors: hold = cyan, ApplyPuni = yellow, kneading = magenta, momi = orange,
+	 * fingertips = green. `milkybody.DebugDraw 1` forces it on globally.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody", meta=(DisplayName="Enable Debug Draw"))
 	bool bEnableDebugDraw = false;
+
+	/**
+	 * [日本語]
+	 * ホールド (SetHoldPuni / LineTraceHoldPuni / SetHoldPuniUnderCursor) の更新がこの秒数途切れたら
+	 * 自動で解除します。カーソルがメッシュ外に出て Release を呼べなくなっても凹みが残りません。
+	 * 0 で無効（ReleaseHoldPuni を呼ぶまで保持）。
+	 *
+	 * [English]
+	 * Auto-release a hold when it hasn't been refreshed for this many seconds, so a dent
+	 * can't get stuck when the cursor leaves the mesh and Release can't be called.
+	 * 0 disables (the hold persists until ReleaseHoldPuni).
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|Hold", meta=(ClampMin="0.0", Units="s"))
+	float HoldAutoReleaseSeconds = 0.15f;
+
+	/**
+	 * [日本語]
+	 * BoneSoftness に載っていないボーンの柔らかさ (0–1)。
+	 *   1 + BoneSoftness で「凹ませたくない部位」を 0 に → ブロックリスト方式
+	 *   0 + BoneSoftness で「凹ませたい部位」を 1 に   → 許可リスト方式
+	 *
+	 * [English]
+	 * Softness of bones not listed in BoneSoftness (0–1).
+	 *   1 + entries set to 0 → block-list (exclude face, hands, …)
+	 *   0 + entries set to 1 → allow-list (only the listed areas dent)
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|Mask", meta=(ClampMin="0.0", ClampMax="1.0"))
+	float DefaultBoneSoftness = 1.0f;
+
+	/** ボーン単位の柔らかさ / Per-bone softness overrides. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|Mask", meta=(TitleProperty="BoneName"))
+	TArray<FMilkyBodyBoneSoftness> BoneSoftness;
+
+	/**
+	 * [日本語]
+	 * 頂点カラーのこのチャンネルを柔らかさに掛け合わせます（白 = 凹む / 黒 = 凹まない）。
+	 * マテリアルで使っているチャンネルとは被らないようにしてください。
+	 * メッシュに頂点カラーが無い場合は無視されます（ログに警告）。
+	 *
+	 * [English]
+	 * Multiply this vertex-color channel into the softness (white = dents, black = rigid).
+	 * Pick a channel your materials don't use. Ignored (with a log warning) when the mesh
+	 * has no vertex colors.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|Mask")
+	EMilkyBodyVertexColorChannel VertexColorMaskChannel = EMilkyBodyVertexColorChannel::None;
+
+	/** 頂点カラーマスクを反転 (黒 = 凹む) / Invert the vertex-color mask (black = dents). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|Mask")
+	bool bInvertVertexColorMask = false;
 
 	virtual UMeshDeformerInstanceSettings* CreateSettingsInstance(
 		UMeshComponent* InMeshComponent) override;

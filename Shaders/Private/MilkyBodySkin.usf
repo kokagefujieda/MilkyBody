@@ -60,17 +60,19 @@ void StorePackedFloat3(RWBuffer<float> InBuffer, uint VertexIndex, float3 Value)
 	InBuffer[Offset + 2] = Value.z;
 }
 
-// Returns the 4x3 (row-major) bone matrix for the given LOD-global vertex,
-// blended by its skin weights. Mirrors Optimus DataInterfaceSkeletonCommon.ush.
-// The skin weight buffer is LOD-wide (shared across sections), but BoneMatrices
-// is per-section and bone indices in the weight stream are section-local.
-float3x4 ComputeWeightedBoneMatrix(uint VertexIndex)
+// Blends the per-bone 3x4 matrices of InBoneMatrices by the vertex's skin
+// weights. Mirrors Optimus DataInterfaceSkeletonCommon.ush.
+// The skin weight buffer is LOD-wide (shared across sections), but the bone
+// buffer is per-section and bone indices in the weight stream are section-local.
+// Any per-bone buffer with the same layout (3 float4 rows per bone) can be
+// blended this way — the softness mask relies on that.
+float3x4 BlendBoneMatrices(Buffer<float4> InBoneMatrices, uint VertexIndex)
 {
 #if !ENABLE_DEFORMER_BONES
 	return float3x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0);
 #elif GPUSKIN_UNLIMITED_BONE_INFLUENCE
 	const uint BlendOffsetCount = InputWeightLookupStream[VertexIndex];
-	return ComputeBoneMatrixWithUnlimitedInfluences(BoneMatrices, InputWeightStream, InputWeightIndexSize, BlendOffsetCount);
+	return ComputeBoneMatrixWithUnlimitedInfluences(InBoneMatrices, InputWeightStream, InputWeightIndexSize, BlendOffsetCount);
 #else
 	const uint StreamOffset = (VertexIndex * (InputWeightStride / 4));
 	const uint NumInfluences = NumBoneInfluences;
@@ -86,16 +88,26 @@ float3x4 ComputeWeightedBoneMatrix(uint VertexIndex)
 		IndicesAndWeights.BlendIndices2 = GetBlendIndices(InputWeightStream, StreamOffset, 1);
 		IndicesAndWeights.BlendWeights2 = GetBlendWeights(InputWeightStream, StreamOffset, 1, NumInfluences);
 	}
-	return ComputeBoneMatrixWithLimitedInfluences(BoneMatrices, IndicesAndWeights, NumInfluences > 4);
+	return ComputeBoneMatrixWithLimitedInfluences(InBoneMatrices, IndicesAndWeights, NumInfluences > 4);
 #endif
 }
 
-// Multi-slot puni state. Up to MAX_PUNI_SLOTS dents apply per dispatch — the
-// existing single hold uses slot 0; kneading mode fills slots 0..N-1. Each
-// slot's displacement adds linearly into Skinned, and their tangent
+// Returns the 4x3 (row-major) skinning matrix for the given LOD-global vertex.
+float3x4 ComputeWeightedBoneMatrix(uint VertexIndex)
+{
+	return BlendBoneMatrices(BoneMatrices, VertexIndex);
+}
+
+// Multi-slot puni state. Up to MAX_PUNI_SLOTS dents apply per dispatch
+// (single hold, one-shot impulses, kneading, momi and external contacts such
+// as fingertips are all packed into slots 0..NumActivePuniSlots-1). Each
+// slot's displacement is evaluated against the undeformed skinned position
+// and summed, so the result does not depend on slot order. Tangent
 // corrections apply sequentially (Sherman–Morrison) — exact for one slot,
-// a small approximation for ≥2 (visually fine for ≤16 dents — 10 fingers).
-#define MAX_PUNI_SLOTS 16
+// a small approximation where dents overlap.
+#ifndef MAX_PUNI_SLOTS
+#define MAX_PUNI_SLOTS 32
+#endif
 float4 PushPosAndRadius[MAX_PUNI_SLOTS];
 float4 PushImpulse[MAX_PUNI_SLOTS];
 uint NumActivePuniSlots;
@@ -105,6 +117,51 @@ float GeometryDepthScale;
 // Scales the per-vertex normal tilt produced by the F⁻ᵀ correction. Lower
 // values remove the directional shading darkening on the dent walls.
 float ShadingDepthScale;
+
+// --- Deformation mask (softness 0..1) ---
+// Per-bone softness packed as fake bone matrices: row0.w = softness, rest 0.
+// Blending them with the skin weights yields Σ(weight × softness) in [0][3].
+uint bUseBoneSoftness;
+float DefaultBoneSoftness;
+Buffer<float4> SoftnessBoneMatrices;
+
+// Optional vertex-color mask. ColorIndexMask is 0 when the mesh has no vertex
+// colors so every vertex reads the (white) element 0 of the bound buffer.
+Buffer<float4> VertexColors;
+uint ColorIndexMask;
+uint VertexColorMaskChannel; // 0 = off, 1 = R, 2 = G, 3 = B, 4 = A
+uint bInvertVertexColorMask;
+
+#ifndef FMANUALFETCH_COLOR_COMPONENT_SWIZZLE
+#define FMANUALFETCH_COLOR_COMPONENT_SWIZZLE .bgra
+#endif
+
+float ComputeVertexSoftness(uint VertexIndex)
+{
+	float Softness = DefaultBoneSoftness;
+#if ENABLE_DEFORMER_BONES
+	if (bUseBoneSoftness != 0)
+	{
+		const float3x4 SoftnessMatrix = BlendBoneMatrices(SoftnessBoneMatrices, VertexIndex);
+		Softness = SoftnessMatrix[0][3];
+	}
+#endif
+
+	if (VertexColorMaskChannel != 0)
+	{
+		const float4 Color = VertexColors[VertexIndex & ColorIndexMask] FMANUALFETCH_COLOR_COMPONENT_SWIZZLE;
+		float Mask = Color.a;
+		if (VertexColorMaskChannel == 1)      { Mask = Color.r; }
+		else if (VertexColorMaskChannel == 2) { Mask = Color.g; }
+		else if (VertexColorMaskChannel == 3) { Mask = Color.b; }
+		if (bInvertVertexColorMask != 0)
+		{
+			Mask = 1.0f - Mask;
+		}
+		Softness *= Mask;
+	}
+	return saturate(Softness);
+}
 
 [numthreads(THREADGROUP_SIZE, 1, 1)]
 void MainCS(uint3 DTid : SV_DispatchThreadID)
@@ -127,27 +184,38 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 	float3 TangentX = mul((float3x3)BoneMatrix, LocalTangentX.xyz);
 	float3 TangentZ = mul((float3x3)BoneMatrix, LocalTangentZ.xyz);
 
-	// Apply each active puni slot. Position displacement is purely additive;
-	// tangent corrections accumulate via sequential rank-1 updates.
+	// Apply each active puni slot. Distances are measured from the undeformed
+	// skinned position so overlapping dents don't depend on slot order.
 	const float EffectiveShadingScale = max(ShadingDepthScale, GeometryDepthScale);
+	const float3 SkinnedBase = Skinned;
+	// HLSL may evaluate both sides of ?:, so branch explicitly to skip the
+	// softness blend entirely when no dent is active.
+	float Softness = 0.0f;
+	[branch]
+	if (NumActivePuniSlots > 0)
+	{
+		Softness = ComputeVertexSoftness(GlobalVertexIndex);
+	}
 
 	[loop]
-	for (uint SlotIdx = 0; SlotIdx < NumActivePuniSlots; ++SlotIdx)
+	for (uint SlotIdx = 0; SlotIdx < NumActivePuniSlots && Softness > 0.0f; ++SlotIdx)
 	{
 		const float4 PPR = PushPosAndRadius[SlotIdx];
-		const float4 PI  = PushImpulse[SlotIdx];
 		if (PPR.w <= 0.001f)
 		{
 			continue;
 		}
 
 		const float R = PPR.w;
-		const float3 Diff = Skinned - PPR.xyz;
+		const float3 Diff = SkinnedBase - PPR.xyz;
 		const float Dist = length(Diff);
 		if (Dist >= R)
 		{
 			continue;
 		}
+
+		// Mask-scaled impulse for this vertex.
+		const float3 Imp = PushImpulse[SlotIdx].xyz * Softness;
 
 		const float r = Dist / R;
 		const float Fall = 1.0f - r;
@@ -156,7 +224,7 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 
 		// Position: push along this slot's impulse with smooth falloff and
 		// the asset's GeometryDepthScale.
-		Skinned += PI.xyz * (Smooth * GeometryDepthScale);
+		Skinned += Imp * (Smooth * GeometryDepthScale);
 
 		// ∇Smooth in component space; gradient of Dist w.r.t. position is the
 		// radial unit vector Diff/Dist.
@@ -167,11 +235,11 @@ void MainCS(uint3 DTid : SV_DispatchThreadID)
 		// Sequential rank-1 update for the tangent basis (Sherman–Morrison).
 		// Both numerator AND denominator share the same scale factor; mixing
 		// shifts the Denom≈0 singularity and creates wave-shaped artifacts.
-		const float Denom = 1.0f + EffectiveShadingScale * dot(GradSmooth, PI.xyz);
+		const float Denom = 1.0f + EffectiveShadingScale * dot(GradSmooth, Imp);
 		const float SafeDenom = (abs(Denom) > 1e-4f) ? Denom : (Denom >= 0.0f ? 1e-4f : -1e-4f);
 
-		TangentX += PI.xyz * dot(GradSmooth, TangentX) * EffectiveShadingScale;
-		TangentZ -= GradSmooth * (dot(PI.xyz, TangentZ) * EffectiveShadingScale / SafeDenom);
+		TangentX += Imp * dot(GradSmooth, TangentX) * EffectiveShadingScale;
+		TangentZ -= GradSmooth * (dot(Imp, TangentZ) * EffectiveShadingScale / SafeDenom);
 	}
 
 	TangentX = normalize(TangentX);

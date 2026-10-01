@@ -1,6 +1,8 @@
 #include "MilkyBodyBlueprintLibrary.h"
 
+#include "MilkyBodyCPUSkinning.h"
 #include "MilkyBodyDeformerInstance.h"
+#include "MilkyBodyPrivate.h"
 #include "Components/ChildActorComponent.h"
 #include "Components/SkinnedMeshComponent.h"
 #include "DrawDebugHelpers.h"
@@ -12,13 +14,11 @@
 #include "Framework/Application/SlateApplication.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/PlayerController.h"
-#include "Kismet/GameplayStatics.h"
 #include "RawIndexBuffer.h"
-#include "Rendering/SkeletalMeshLODRenderData.h"
-#include "Rendering/SkeletalMeshRenderData.h"
-#include "Rendering/SkinWeightVertexBuffer.h"
-#include "SkeletalRenderPublic.h"
+#include "UObject/UObjectIterator.h"
 #include "Widgets/SViewport.h"
+
+DECLARE_CYCLE_STAT(TEXT("Polygon Trace"), STAT_MilkyBody_PolygonTrace, STATGROUP_MilkyBody);
 
 // ─────────────────────────────────────────────────────────────────────────────
 namespace MilkyBodyBPPrivate
@@ -71,121 +71,6 @@ namespace MilkyBodyBPPrivate
 	{
 		TSet<AActor*> VisitedActors;
 		GatherMilkyBodyTargetsRecursive(Actor, OutComps, VisitedActors);
-	}
-
-	static void GatherMilkyBodyTargetsInWorld(
-		UWorld* World,
-		TArray<USkinnedMeshComponent*>& OutComps)
-	{
-		OutComps.Reset();
-		if (!World)
-		{
-			return;
-		}
-
-		TSet<AActor*> VisitedActors;
-		TArray<AActor*> AllActors;
-		UGameplayStatics::GetAllActorsOfClass(World, AActor::StaticClass(), AllActors);
-		for (AActor* Actor : AllActors)
-		{
-			GatherMilkyBodyTargetsRecursive(Actor, OutComps, VisitedActors);
-		}
-	}
-
-	static USkinnedMeshComponent* FindBestTraceHitOnTargets(
-		const TArray<USkinnedMeshComponent*>& Comps,
-		const FVector& Start,
-		const FVector& End,
-		FHitResult& OutHit)
-	{
-		const FVector RayDir = (End - Start).GetSafeNormal();
-		const FVector Segment = End - Start;
-		const float SegmentLenSq = Segment.SizeSquared();
-		float BestDistSq = FLT_MAX;
-		USkinnedMeshComponent* BestComp = nullptr;
-
-		for (USkinnedMeshComponent* Comp : Comps)
-		{
-			if (!IsTraceableSkinnedMesh(Comp))
-			{
-				continue;
-			}
-
-			FVector BoxHitPoint, BoxHitNormal;
-			float BoxHitTime;
-			const bool bBoxHit = FMath::LineExtentBoxIntersection(
-				Comp->Bounds.GetBox().ExpandBy(5.0f),
-				Start,
-				End,
-				FVector::ZeroVector,
-				BoxHitPoint,
-				BoxHitNormal,
-				BoxHitTime);
-
-			FVector BroadHitPoint = BoxHitPoint;
-			FVector BroadHitNormal = BoxHitNormal;
-			if (!bBoxHit)
-			{
-				if (SegmentLenSq <= SMALL_NUMBER)
-				{
-					continue;
-				}
-
-				const FVector SphereCenter = Comp->Bounds.Origin;
-				const float SphereRadius = FMath::Max(Comp->Bounds.SphereRadius * 1.15f, 10.0f);
-				const float ClosestT = FMath::Clamp(
-					FVector::DotProduct(SphereCenter - Start, Segment) / SegmentLenSq,
-					0.0f,
-					1.0f);
-				const FVector ClosestPoint = Start + Segment * ClosestT;
-				if (FVector::DistSquared(ClosestPoint, SphereCenter) > FMath::Square(SphereRadius))
-				{
-					continue;
-				}
-
-				BroadHitPoint = ClosestPoint;
-				BroadHitNormal = (ClosestPoint - SphereCenter).GetSafeNormal();
-				if (BroadHitNormal.IsNearlyZero())
-				{
-					BroadHitNormal = -RayDir;
-				}
-			}
-
-			const float BroadDistSq = FVector::DistSquared(Start, BroadHitPoint);
-			if (BroadDistSq >= BestDistSq)
-			{
-				continue;
-			}
-
-			FHitResult CompHit;
-			FCollisionQueryParams Params(NAME_None, /*bTraceComplex=*/true);
-			if (bBoxHit && Comp->LineTraceComponent(CompHit, Start, End, Params))
-			{
-				const float HitDistSq = FVector::DistSquared(Start, CompHit.ImpactPoint);
-				if (HitDistSq < BestDistSq)
-				{
-					BestDistSq = HitDistSq;
-					OutHit = CompHit;
-					OutHit.Component = Comp;
-					OutHit.HitObjectHandle = FActorInstanceHandle(Comp->GetOwner());
-					BestComp = Comp;
-				}
-			}
-			else
-			{
-				BestDistSq = BroadDistSq;
-				OutHit = FHitResult();
-				OutHit.ImpactPoint = BroadHitPoint;
-				OutHit.ImpactNormal = BroadHitNormal.IsNearlyZero() ? -RayDir : BroadHitNormal.GetSafeNormal();
-				OutHit.Location = BroadHitPoint;
-				OutHit.Normal = OutHit.ImpactNormal;
-				OutHit.Component = Comp;
-				OutHit.HitObjectHandle = FActorInstanceHandle(Comp->GetOwner());
-				BestComp = Comp;
-			}
-		}
-
-		return BestComp;
 	}
 
 	static bool DeprojectCursorToWorldIgnoringWidgets(
@@ -273,72 +158,6 @@ namespace MilkyBodyBPPrivate
 		}
 	}
 
-	// ── Core world-space trace ────────────────────────────────────────────────
-	//
-	// Priority:
-	//   1. LineTraceSingleByChannel  (fast; needs Physics Asset + correct channel)
-	//   2. Per-component AABB pre-filter → LineTraceComponent
-	//      (uses Physics Asset bodies when present, otherwise AABB hit point)
-	//
-	// Returns the hit SkinnedMeshComponent and fills OutHit on success.
-	// Draws 3-D debug when bEnableDebug is true.
-	static USkinnedMeshComponent* TraceSkinnedMesh(
-		UWorld* World,
-		const FVector& Start,
-		const FVector& End,
-		ECollisionChannel TraceChannel,
-		bool bEnableDebug,
-		FHitResult& OutHit)
-	{
-		if (!World) return nullptr;
-
-		USkinnedMeshComponent* MeshComp = nullptr;
-
-		// ── 1. Channel trace ─────────────────────────────────────────────────
-		{
-			FCollisionQueryParams QP(NAME_None, /*bTraceComplex=*/true);
-			FHitResult ChannelHit;
-			if (World->LineTraceSingleByChannel(ChannelHit, Start, End, TraceChannel, QP))
-			{
-				if (USkinnedMeshComponent* HitSkinned = Cast<USkinnedMeshComponent>(ChannelHit.GetComponent()))
-				{
-					if (IsTraceableSkinnedMesh(HitSkinned))
-					{
-						OutHit = ChannelHit;
-						MeshComp = HitSkinned;
-					}
-				}
-
-				if (!MeshComp)
-				{
-					TArray<USkinnedMeshComponent*> ActorTreeComps;
-					GatherMilkyBodyTargetsFromActorTree(ChannelHit.GetActor(), ActorTreeComps);
-					MeshComp = FindBestTraceHitOnTargets(ActorTreeComps, Start, End, OutHit);
-				}
-			}
-		}
-
-		// ── 2. Fallback: AABB → LineTraceComponent ────────────────────────────
-		if (!MeshComp)
-		{
-			TArray<USkinnedMeshComponent*> WorldComps;
-			GatherMilkyBodyTargetsInWorld(World, WorldComps);
-			MeshComp = FindBestTraceHitOnTargets(WorldComps, Start, End, OutHit);
-		}
-
-		// ── Debug draw ────────────────────────────────────────────────────────
-		if (bEnableDebug)
-		{
-			DrawTraceDebug(
-				World, Start, End,
-				MeshComp ? OutHit.ImpactPoint  : End,
-				MeshComp ? OutHit.ImpactNormal : FVector::ZeroVector,
-				MeshComp != nullptr);
-		}
-
-		return MeshComp;
-	}
-
 	// Möller–Trumbore ray-vs-triangle. Dir is *not* normalized; OutT is in the
 	// same parameterization as Dir, so OutT in [0,1] means the hit lies on the
 	// segment Origin → Origin+Dir.
@@ -364,26 +183,24 @@ namespace MilkyBodyBPPrivate
 		return OutT >= 0.0f;
 	}
 
-	// Polygon-precise trace against the skinned mesh: walks every
-	// SkinnedMeshComponent in the world, AABB-prefilters, then CPU-skins the
-	// active LOD and tests each triangle. Returns the closest hit and fills
-	// OutHit. NOT cheap — call at click rate, not per-frame.
-	static USkinnedMeshComponent* TraceSkinnedMeshPolygon(
-		UWorld* World,
+	// Polygon-precise trace against the CPU-skinned triangles of Comps
+	// (AABB-prefiltered). Returns the closest hit on the segment and fills
+	// OutHit; the impact normal always faces the ray origin. Cost scales with
+	// the triangle count of the meshes whose bounds the segment crosses.
+	static USkinnedMeshComponent* PolygonTraceComponents(
+		const TArray<USkinnedMeshComponent*>& Comps,
 		const FVector& Start,
 		const FVector& End,
-		bool bEnableDebug,
 		FHitResult& OutHit)
 	{
-		if (!World) return nullptr;
+		SCOPE_CYCLE_COUNTER(STAT_MilkyBody_PolygonTrace);
 
 		USkinnedMeshComponent* BestComp   = nullptr;
 		float                  BestT      = 1.0f + KINDA_SMALL_NUMBER;
 		FVector                BestHit    = FVector::ZeroVector;
 		FVector                BestNormal = FVector::ZeroVector;
+		const FVector          RayDir     = (End - Start).GetSafeNormal();
 
-		TArray<USkinnedMeshComponent*> Comps;
-		GatherMilkyBodyTargetsInWorld(World, Comps);
 		for (USkinnedMeshComponent* Comp : Comps)
 		{
 			if (!IsTraceableSkinnedMesh(Comp)) continue;
@@ -399,63 +216,46 @@ namespace MilkyBodyBPPrivate
 				continue;
 			}
 
-			FSkeletalMeshRenderData* RenderData = Comp->GetSkeletalMeshRenderData();
-			if (!RenderData) continue;
+			MilkyBody::FCPUSkinnedMesh Mesh;
+			if (!MilkyBody::BuildCPUSkinnedMesh(Comp, Mesh)) continue;
 
-			const int32 LODIndex = Comp->MeshObject
-				? Comp->MeshObject->GetLOD()
-				: Comp->GetPredictedLODLevel();
-			if (!RenderData->LODRenderData.IsValidIndex(LODIndex)) continue;
-
-			FSkeletalMeshLODRenderData& LODData = RenderData->LODRenderData[LODIndex];
-			const FSkinWeightVertexBuffer* SkinWeightBuffer = LODData.GetSkinWeightVertexBuffer();
-			if (!SkinWeightBuffer) continue;
-
-			const FRawStaticIndexBuffer16or32Interface* IndexBuffer =
-				LODData.MultiSizeIndexContainer.GetIndexBuffer();
-			if (!IndexBuffer || IndexBuffer->Num() == 0) continue;
-
-			// CPU-skin every vertex of this LOD (component space)
-			TArray<FMatrix44f> RefToLocals;
-			Comp->CacheRefToLocalMatrices(RefToLocals);
-			TArray<FVector3f> Positions;
-			USkinnedMeshComponent::ComputeSkinnedPositions(
-				Comp, Positions, RefToLocals, LODData, *SkinWeightBuffer);
-			if (Positions.Num() == 0) continue;
-
-			// Trace in component space to avoid per-triangle world transforms
-			const FTransform& Xform     = Comp->GetComponentTransform();
+			// Trace in component space to avoid per-triangle world transforms.
+			// An affine transform preserves the segment parameter T, so T stays
+			// comparable across components.
+			const FTransform& Xform      = Mesh.ComponentToWorld;
 			const FVector     LocalStart = Xform.InverseTransformPosition(Start);
 			const FVector     LocalEnd   = Xform.InverseTransformPosition(End);
 			const FVector     LocalDir   = LocalEnd - LocalStart;
 
-			const int32 NumIndices = IndexBuffer->Num();
+			const int32 NumIndices = Mesh.NumIndices();
 			for (int32 i = 0; i + 2 < NumIndices; i += 3)
 			{
-				const uint32 I0 = IndexBuffer->Get(i);
-				const uint32 I1 = IndexBuffer->Get(i + 1);
-				const uint32 I2 = IndexBuffer->Get(i + 2);
-				if (!Positions.IsValidIndex(I0) ||
-					!Positions.IsValidIndex(I1) ||
-					!Positions.IsValidIndex(I2))
+				const uint32 I0 = Mesh.GetIndex(i);
+				const uint32 I1 = Mesh.GetIndex(i + 1);
+				const uint32 I2 = Mesh.GetIndex(i + 2);
+				if (!Mesh.Positions.IsValidIndex(I0) ||
+					!Mesh.Positions.IsValidIndex(I1) ||
+					!Mesh.Positions.IsValidIndex(I2))
 				{
 					continue;
 				}
-				const FVector V0((FVector3f)Positions[I0]);
-				const FVector V1((FVector3f)Positions[I1]);
-				const FVector V2((FVector3f)Positions[I2]);
+				const FVector V0(Mesh.Positions[I0]);
+				const FVector V1(Mesh.Positions[I1]);
+				const FVector V2(Mesh.Positions[I2]);
 
 				float HitT;
 				if (RayTriangleIntersect(LocalStart, LocalDir, V0, V1, V2, HitT)
 					&& HitT <= 1.0f && HitT < BestT)
 				{
 					BestT = HitT;
-					const FVector LocalHit = LocalStart + LocalDir * HitT;
-					BestHit = Xform.TransformPosition(LocalHit);
-					const FVector LocalN =
-						FVector::CrossProduct(V1 - V0, V2 - V0).GetSafeNormal();
-					// Rotation-only transform (skeletal characters typically use uniform scale)
-					BestNormal = Xform.GetRotation().RotateVector(LocalN).GetSafeNormal();
+					BestHit = Xform.TransformPosition(LocalStart + LocalDir * HitT);
+					const FVector LocalN = FVector::CrossProduct(V1 - V0, V2 - V0);
+					FVector WorldN = Xform.TransformVectorNoScale(LocalN).GetSafeNormal();
+					if (FVector::DotProduct(WorldN, RayDir) > 0.0f)
+					{
+						WorldN = -WorldN; // face the viewer: the push goes away from the ray origin
+					}
+					BestNormal = WorldN;
 					BestComp   = Comp;
 				}
 			}
@@ -463,21 +263,106 @@ namespace MilkyBodyBPPrivate
 
 		if (BestComp)
 		{
-			OutHit                = FHitResult();
-			OutHit.ImpactPoint    = BestHit;
-			OutHit.ImpactNormal   = BestNormal;
-			OutHit.Location       = BestHit;
-			OutHit.Normal         = BestNormal;
-			OutHit.Component      = BestComp;
+			OutHit                 = FHitResult();
+			OutHit.ImpactPoint     = BestHit;
+			OutHit.ImpactNormal    = BestNormal;
+			OutHit.Location        = BestHit;
+			OutHit.Normal          = BestNormal;
+			OutHit.Component       = BestComp;
 			OutHit.HitObjectHandle = FActorInstanceHandle(BestComp->GetOwner());
 		}
+		return BestComp;
+	}
 
-		if (bEnableDebug)
+	// ── Core world-space trace ────────────────────────────────────────────────
+	//
+	// Priority:
+	//   1. LineTraceSingleByChannel. A skinned mesh hit (Physics Asset body) is
+	//      used directly. Any other blocking hit (capsule, accessory, wall)
+	//      polygon-traces that actor's own skinned meshes, and occludes
+	//      everything behind it.
+	//   2. Polygon-precise trace over every skinned mesh in the world, up to the
+	//      blocking hit (works without a Physics Asset).
+	//
+	// Returns the hit SkinnedMeshComponent and fills OutHit on success.
+	// Draws 3-D debug when bEnableDebug is true.
+	static USkinnedMeshComponent* TraceSkinnedMesh(
+		UWorld* World,
+		const FVector& Start,
+		const FVector& End,
+		ECollisionChannel TraceChannel,
+		bool bEnableDebug,
+		FHitResult& OutHit)
+	{
+		if (!World) return nullptr;
+
+		USkinnedMeshComponent* MeshComp = nullptr;
+		FVector FallbackEnd = End;
+
+		// ── 1. Channel trace ─────────────────────────────────────────────────
+		{
+			FCollisionQueryParams QP(NAME_None, /*bTraceComplex=*/true);
+			FHitResult ChannelHit;
+			if (World->LineTraceSingleByChannel(ChannelHit, Start, End, TraceChannel, QP))
+			{
+				USkinnedMeshComponent* HitSkinned = Cast<USkinnedMeshComponent>(ChannelHit.GetComponent());
+				if (HitSkinned && IsTraceableSkinnedMesh(HitSkinned))
+				{
+					OutHit = ChannelHit;
+					MeshComp = HitSkinned;
+				}
+				else
+				{
+					TArray<USkinnedMeshComponent*> ActorTreeComps;
+					GatherMilkyBodyTargetsFromActorTree(ChannelHit.GetActor(), ActorTreeComps);
+					MeshComp = PolygonTraceComponents(ActorTreeComps, Start, End, OutHit);
+					FallbackEnd = ChannelHit.ImpactPoint;
+				}
+			}
+		}
+
+		// ── 2. Fallback: polygon-precise trace ───────────────────────────────
+		if (!MeshComp)
+		{
+			TArray<USkinnedMeshComponent*> WorldComps;
+			MilkyBody::GatherSkinnedMeshesInWorld(World, /*bRequireMilkyBody=*/false, WorldComps);
+			MeshComp = PolygonTraceComponents(WorldComps, Start, FallbackEnd, OutHit);
+		}
+
+		// ── Debug draw ────────────────────────────────────────────────────────
+		if (bEnableDebug || CVarMilkyBodyDebugDraw.GetValueOnGameThread() != 0)
 		{
 			DrawTraceDebug(
 				World, Start, End,
-				BestComp ? BestHit    : End,
-				BestComp ? BestNormal : FVector::ZeroVector,
+				MeshComp ? OutHit.ImpactPoint  : End,
+				MeshComp ? OutHit.ImpactNormal : FVector::ZeroVector,
+				MeshComp != nullptr);
+		}
+
+		return MeshComp;
+	}
+
+	// Polygon-precise trace against every skinned mesh in the world, ignoring
+	// collision entirely. NOT cheap — call at click rate, not per-frame.
+	static USkinnedMeshComponent* TraceSkinnedMeshPolygon(
+		UWorld* World,
+		const FVector& Start,
+		const FVector& End,
+		bool bEnableDebug,
+		FHitResult& OutHit)
+	{
+		if (!World) return nullptr;
+
+		TArray<USkinnedMeshComponent*> Comps;
+		MilkyBody::GatherSkinnedMeshesInWorld(World, /*bRequireMilkyBody=*/false, Comps);
+		USkinnedMeshComponent* BestComp = PolygonTraceComponents(Comps, Start, End, OutHit);
+
+		if (bEnableDebug || CVarMilkyBodyDebugDraw.GetValueOnGameThread() != 0)
+		{
+			DrawTraceDebug(
+				World, Start, End,
+				BestComp ? OutHit.ImpactPoint  : End,
+				BestComp ? OutHit.ImpactNormal : FVector::ZeroVector,
 				BestComp != nullptr);
 		}
 		return BestComp;
@@ -960,4 +845,47 @@ bool UMilkyBodyBlueprintLibrary::BeginMomiUnderCursor(
 
 	OutMeshComp = MeshComp;
 	return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State queries / release helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+float UMilkyBodyBlueprintLibrary::GetPuniAmount(USkinnedMeshComponent* MeshComp)
+{
+	if (!MeshComp) return 0.0f;
+	const auto* Inst = Cast<UMilkyBodyDeformerInstance>(MeshComp->GetMeshDeformerInstance());
+	return Inst ? Inst->GetPuniAmount() : 0.0f;
+}
+
+bool UMilkyBodyBlueprintLibrary::IsPuniActive(USkinnedMeshComponent* MeshComp)
+{
+	if (!MeshComp) return false;
+	const auto* Inst = Cast<UMilkyBodyDeformerInstance>(MeshComp->GetMeshDeformerInstance());
+	return Inst && Inst->IsPuniActive();
+}
+
+void UMilkyBodyBlueprintLibrary::ReleaseAllPuni(USkinnedMeshComponent* MeshComp, float FadeOutSeconds)
+{
+	if (!MeshComp) return;
+	auto* Inst = Cast<UMilkyBodyDeformerInstance>(MeshComp->GetMeshDeformerInstance());
+	if (!Inst) return;
+	Inst->ReleaseAll(FadeOutSeconds);
+}
+
+void UMilkyBodyBlueprintLibrary::ReleaseAllPuniInWorld(UObject* WorldContextObject, float FadeOutSeconds)
+{
+	UWorld* World = GEngine->GetWorldFromContextObject(WorldContextObject, EGetWorldErrorMode::LogAndReturnNull);
+	if (!World) return;
+
+	// Includes hidden / unregistered meshes so nothing can stay dented.
+	for (TObjectIterator<USkinnedMeshComponent> It; It; ++It)
+	{
+		USkinnedMeshComponent* Comp = *It;
+		if (!IsValid(Comp) || Comp->GetWorld() != World) continue;
+		if (auto* Inst = Cast<UMilkyBodyDeformerInstance>(Comp->GetMeshDeformerInstance()))
+		{
+			Inst->ReleaseAll(FadeOutSeconds);
+		}
+	}
 }

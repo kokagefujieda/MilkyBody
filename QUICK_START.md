@@ -1,137 +1,76 @@
-# MilkyBody プラグイン クイックスタート
+# MilkyBody クイックスタート
 
-## 実装完了: Phase 4b GPU Compute Shader Dispatch ✓
+MilkyBody は SkeletalMesh の表面を「プニッ」と凹ませる GPU デフォーマです（UE 5.7）。
+スキニングと凹みを 1 本のコンピュートシェーダーで処理します。カーソルでの押し込み・ドラッグ・こね・揉み・指先コライダーを、同じメッシュに同時に重ねられます。
 
-MilkyBody プラグインの GPU PBD (Position-Based Dynamics) ソフトボディデフォーマーが完全に実装されました。
+## 1. デフォーマアセットを作る
 
-**Commit**: 82f15a0
+1. コンテンツブラウザで右クリック → **Animation → Deformers → Milky Body Deformer**
+2. 名前を付けて保存（例: `DA_MilkyBody`）
 
-## 動作確認方法（3ステップ）
+## 2. メッシュに割り当てる
 
-### Step 1: エディタで DA_MilkyBodyDeformer を作成
+SkeletalMeshComponent の詳細パネル → **Mesh Deformer** に `DA_MilkyBody` を設定します。
 
-```
-1. コンテンツブラウザを開く
-2. 右クリック → その他 → データアセット
-3. クラス: MilkyBodyDeformer を選択
-4. 名前: DA_MilkyBodyDeformer として保存
-```
+- デフォーマが効くのは **PIE やゲーム中だけ** です。エディタビューポートやアセットプレビューでは、通常のスキニングに戻ります（クラッシュ回避のため）。
 
-### Step 2: デフォーマー設定
+## 3. Blueprint から凹ませる
 
-ダブルクリックして詳細パネルを開き、以下を設定:
+| やりたいこと | ノード |
+|---|---|
+| クリックした所を一瞬凹ませる | `Apply Puni Under Cursor` |
+| 押している間ずっと凹ませる（ドラッグで皮膚を引っ張る） | 毎フレーム `Set Hold Puni Under Cursor`、離したら `Release Hold Puni` か `Release All Puni In World` |
+| こねる（指がランダムに動く） | `Begin Kneading Under Cursor` → `End Kneading` |
+| 揉む（円運動） | `Begin Momi Under Cursor` → `End Momi` |
+| 座標を直接指定 | `Apply Puni` / `Set Hold Puni` / `Begin Kneading` / `Begin Momi` |
+| 凹み量でサウンドや演出を動かす | `Get Puni Amount` / `Is Puni Active` |
+| 全部解除 | `Release All Puni`（メッシュ単位）/ `Release All Puni In World` |
 
-| パラメータ | 値 | 説明 |
-|-----------|----|----|
-| **VertexIndexStart** | 0 | 変形対象の最初の頂点インデックス |
-| **VertexIndexEnd** | 500 | 変形対象の最後の頂点インデックス |
-| **Stiffness** | 0.8 | アニメーション位置への引き戻し強度 (0.0-1.0) |
-| **Damping** | 0.1 | 速度減衰 (0.0-1.0) |
-| **SolverIterations** | 4 | Verlet 積分の反復回数 (1-16) |
-| **GlobalBlendWeight** | 1.0 | デフォーマー全体のブレンド (0.0-1.0) |
+これらは全部 **同時に重ねられます**（最大 32 箇所）。たとえば、ホールドしながら指コライダーで触ることもできます。
 
-### Step 3: Mannequin に適用して実行
+ホールドは、更新が `HoldAutoReleaseSeconds`（既定 0.15 秒）途切れると自動で解除されます。カーソルがメッシュの外に出ても、凹みは残りません。
 
-```
-1. DefaultLevel を開く
-2. Outliner で "SK_Mannequin_C" を選択
-3. 詳細パネルの Skeletal Mesh Component を探す
-4. "Mesh Deformer" セクション:
-   - Enabled: チェック ON
-   - Deformer: DA_MilkyBodyDeformer を設定
-5. Play ボタンで再生
-```
+## 4. 指先で揉む（BoneSpherePuniComponent）
 
-## 期待される動作
+1. 手の SkeletalMesh アセットを開く → **Asset User Data** → `+` → **Milky Body Bone Collider**
+2. `Spheres` に指先ボーン名・半径・オフセットを登録する
+3. 手のアクターに **BoneSpherePuni** コンポーネントを追加する（ターゲットは自動で検出されます）
 
-- キャラクターが動く際に、指定した頂点範囲がリアルに変形
-- 重力による自然な揺れ
-- Stiffness でアニメーション位置に引き戻される
-- Damping で速度が減衰
+- 指ごとに独立したバネを持つので、離れた指から順に、なめらかに戻ります。
+- `bDepthFromPenetration`（既定 ON）: 食い込んだ量だけ深く凹みます。`ImpulseDepth` が深さの上限です。
+- 両手（コンポーネント 2 つ）で同じ体を触っても、上書きし合いません。
 
-## パラメータ調整ガイド
+## 5. 凹む部位を限定する（マスク）
 
-### Stiffness の効果
-```
-0.0: 重力だけで垂れ下がる（素材が超柔らか）
-0.5: バランス型（標準的な弾力性）
-1.0: すぐに元に戻る（硬い素材）
-```
+デフォーマアセットの **Mask** カテゴリで設定します。
 
-### Damping の効果
-```
-0.0: 永遠に振動する（減衰なし）
-0.5: 自然な減衰（推奨）
-1.0: すぐに停止する（非常に粘性の高い素材）
-```
+- `DefaultBoneSoftness` + `BoneSoftness`: ボーンごとに柔らかさ (0–1) を設定します（子ボーンにも継承できます）。
+  - 例: Default=1 にして、`head` と `hand_l` / `hand_r` を 0 にすると、顔と手が凹まなくなります。
+- `VertexColorMaskChannel`: 頂点カラーの R/G/B/A のどれかを掛け合わせます（白 = 凹む）。マテリアルで使っていないチャンネルを選んでください。
 
-### VertexIndexRange のサイズ
-```
-小（0-100）: ほぼ視覚的に見えない
-中（0-500）: 目立つ変形
-大（0-2000）: 大幅な変形（計算負荷増加）
-```
+## 6. 主なパラメータ（デフォーマアセット）
 
-## トラブルシューティング
+| 項目 | 意味 |
+|---|---|
+| Stiffness | バネの硬さ。高いほど素早く凹み、素早く戻る |
+| Damping | 揺れの減衰。低いほどプルプルが残る（0–1 の全範囲で安定） |
+| GeometryDepthScale | 実際に頂点を動かす量。凹みの中が暗くなりすぎるなら下げる |
+| ShadingDepthScale | 法線の傾き（陰影上の凹み感） |
+| HoldFollowSmoothing / HoldMaxFollowOffsetRatio | ドラッグで引っ張るときの追従具合 |
+| HoldAutoReleaseSeconds | ホールドの自動解除までの秒数（0 で無効） |
+| Enable Debug Draw | 凹みの位置を表示する（ホールド=シアン / ApplyPuni=黄 / こね=マゼンタ / 揉み=オレンジ / 指=緑） |
 
-### エディタが起動しない
-```bash
-# ビルドを再実行
-"J:/UE_5.7/Engine/Build/BatchFiles/Build.bat" MilkemistEditor Win64 Development -Project="J:/Milkemist_plane/Milkemist/Milkemist.uproject" -WaitMutex
-```
+## 7. デバッグ用コンソールコマンド
 
-### 変形が見えない場合
+| コマンド | 効果 |
+|---|---|
+| `milkybody.Enable 0` | MilkyBody を完全にバイパスして、標準スキニングに戻す（見比べ用） |
+| `milkybody.DebugDraw 1` | 全デバッグ描画を強制 ON にする |
+| `stat MilkyBody` | CPU コストを表示する（Tick / CPU スキニング / ポリゴントレース など） |
+| `ProfileGPU` | GPU コストを表示する（「MilkyBody」スコープ） |
 
-1. **VertexIndexEnd が十分に大きいか確認**
-   - Mannequin の胸部: 通常 500～2000 インデックス
-   - 小さすぎると効果が見えない
+## 8. パッケージ版での注意
 
-2. **GlobalBlendWeight = 1.0 か確認**
-   - 0 だと完全に効果が無くなる
+ポリゴン精密トレースと指先の表面スナップは、CPU 側の頂点データを使います。パッケージ版では、対象 SkeletalMesh の LOD 設定で **Allow CPU Access** を ON にしてください。OFF のままだと、その機能だけスキップされます（ログに 1 回警告が出ます）。
 
-3. **Stiffness が高すぎないか確認**
-   - 1.0 だと頂点がアニメーション位置にロック
-   - 0.5～0.8 がバランス型
-
-4. **エディタログを確認**
-   - `Saved/Logs/Milkemist.log` を確認
-   - Shader 関連のエラーが出ていないか確認
-
-## 実装の詳細
-
-### GPU Compute Shader (HLSL)
-- **File**: `Plugins/MilkyBody/Shaders/Private/MilkyBodyPBD.usf`
-- **Kernel**: `[numthreads(64, 1, 1)] void MainCS()`
-- **Physics**: Verlet 積分 + Gravity + Stiffness 引き戻し
-
-### C++ RDG 統合
-- **File**: `Plugins/MilkyBody/Source/MilkyBody/Private/MilkyBodyDeformerInstance.cpp`
-- **Method**: `EnqueueWork()` で毎フレーム GPU dispatch
-- **Buffers**: ParticleState (persistent UAV) で Verlet 履歴を保持
-
-### Shader Registration
-- **Method**: FCoreDelegates::OnPostEngineInit フック
-- **Directory**: `/MilkyBodyShaders` → `Plugins/MilkyBody/Shaders`
-- **Macro**: IMPLEMENT_GLOBAL_SHADER で FMilkyBodyPBDCS 登録
-
-## 次のステップ（Phase 5）
-
-### 距離制約（エッジ制約）
-隣接頂点間の距離を保つ制約を追加
-→ より堅い素材をシミュレート
-
-### 法線再計算
-変形メッシュの法線を再計算
-→ 陰影が正しく更新される
-
-### コリジョン
-球体による衝突判定を追加
-→ 指でプッシュして変形させる
-
-## ライセンス
-
-MIT License (no copyright notice required)
-
----
-
-**準備完了！** エディタを開いてテストしてください。
+Physics Asset があれば、カーソル系のトレースはそちらを優先して使います。

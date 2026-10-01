@@ -26,8 +26,9 @@ class USkinnedMeshComponent;
  * tweaks.
  *
  * Typical setup: ten fingertip bones each get a small sphere; only the fingers
- * whose sphere actually intersects the target body claim a puni-hold slot
- * (up to 10 simultaneously).
+ * whose sphere actually intersects the target body press it. Each finger fades
+ * in/out on its own spring, and several components (e.g. both hands) can drive
+ * the same body at once.
  */
 UCLASS(ClassGroup=(MilkyBody), meta=(BlueprintSpawnableComponent), BlueprintType, Blueprintable)
 class MILKYBODY_API UBoneSpherePuniComponent : public UActorComponent
@@ -79,12 +80,34 @@ public:
 	TArray<FBoneColliderSphere> AdditionalSpheres;
 
 	/**
-	 * [日本語] 押し込み深さ (cm)。スナップ時は内向き法線 × この値が impulse になる。
-	 * [English] Push depth in cm. When surface-snapped, impulse = -normal * ImpulseDepth.
+	 * [日本語] 押し込み深さ (cm)。bDepthFromPenetration が ON のときは深さの上限。
+	 *           見た目の凹み量 = 深さ × デフォーマの GeometryDepthScale。
+	 * [English] Push depth in cm. Acts as the upper limit when bDepthFromPenetration
+	 *           is on. Visible displacement = depth × the deformer's GeometryDepthScale.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|BoneSpherePuni",
 		meta=(ClampMin="0.0"))
 	float ImpulseDepth = 5.0f;
+
+	/**
+	 * [日本語] 食い込み連動 (表面スナップ時のみ)。ON なら深さ = 球の食い込み量 × PenetrationDepthScale
+	 *           (上限 ImpulseDepth)。軽く触れると浅く、押し込むと深く凹む。OFF なら常に ImpulseDepth。
+	 * [English] Penetration-driven depth (surface snap only). When on, depth =
+	 *           sphere penetration × PenetrationDepthScale, capped at ImpulseDepth, so a
+	 *           light touch makes a shallow dent and a firm press a deep one. When off,
+	 *           every touching finger uses ImpulseDepth.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|BoneSpherePuni")
+	bool bDepthFromPenetration = true;
+
+	/**
+	 * [日本語] 食い込み量 → 深さの倍率。肌を指に追従させたい場合は 1 / GeometryDepthScale 程度にする。
+	 * [English] Penetration → depth multiplier. Use about 1 / GeometryDepthScale to make the
+	 *           skin follow the fingertip exactly.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="MilkyBody|BoneSpherePuni",
+		meta=(ClampMin="0.0", EditCondition="bDepthFromPenetration"))
+	float PenetrationDepthScale = 1.0f;
 
 	/**
 	 * [日本語] 表面スナップを行うか。
@@ -160,8 +183,8 @@ private:
 	TArray<TWeakObjectPtr<USkinnedMeshComponent>> CachedAutoTargets;
 	float TimeSinceTargetRefresh = 1e9f; // force refresh on first tick
 
-	// Targets that received a BeginExternalMultiHold last frame; used so we can
-	// call End on ones that no longer have any sphere intersecting them.
+	// Targets that received contacts last frame; used so we can release them
+	// once no sphere touches them any more.
 	TSet<TWeakObjectPtr<USkinnedMeshComponent>> PrevDrivenTargets;
 
 	// 解決できない時の警告を 1 回だけ出すためのフラグ（Tick で連発しないように）

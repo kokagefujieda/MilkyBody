@@ -26,6 +26,10 @@ public:
 	// ── Direct API ────────────────────────────────────────────────────────────
 
 	// Trigger a "puni" dent on a SkeletalMesh that has a MilkyBodyDeformer assigned.
+	// The dent presses toward WorldImpulse (direction × depth in cm), holds for
+	// DurationSeconds and then springs back. DurationSeconds = 0 gives a short
+	// velocity kick instead. Up to 4 one-shots can overlap; they also layer on top
+	// of holds, kneading, momi and BoneSpherePuni fingertips.
 	UFUNCTION(BlueprintCallable, Category="MilkyBody", meta=(AdvancedDisplay="Radius,DurationSeconds"))
 	static void ApplyPuni(
 		USkinnedMeshComponent* MeshComp,
@@ -35,8 +39,11 @@ public:
 		float DurationSeconds = 0.3f);
 
 	// Hold-style dent via direct world-space parameters. Call each frame while held.
-	// Returns the name of the bone on MeshComp closest to WorldLocation.
-	// If no MilkyBodyDeformer is attached, no dent is applied but the bone is still returned.
+	// If the calls stop for longer than the deformer's HoldAutoReleaseSeconds the
+	// hold is released automatically (so it can't get stuck when the cursor
+	// leaves the mesh). Returns the name of the bone on MeshComp closest to
+	// WorldLocation. If no MilkyBodyDeformer is attached, no dent is applied but
+	// the bone is still returned.
 	UFUNCTION(BlueprintCallable, Category="MilkyBody", meta=(AdvancedDisplay="Radius"))
 	static FName SetHoldPuni(
 		USkinnedMeshComponent* MeshComp,
@@ -44,7 +51,7 @@ public:
 		FVector WorldImpulse,
 		float Radius = 15.0f);
 
-	// Release a held puni dent.
+	// Release a held puni dent (only the hold; see ReleaseAllPuni for everything).
 	UFUNCTION(BlueprintCallable, Category="MilkyBody")
 	static void ReleaseHoldPuni(
 		USkinnedMeshComponent* MeshComp,
@@ -57,9 +64,12 @@ public:
 	// arrow for impact normal — visible for ~2 s in the viewport.
 	//
 	// Detection priority:
-	//   1. Channel trace (fast, requires Physics Asset on the mesh)
-	//   2. LineTraceComponent per component (uses Physics Asset bodies if present)
-	//   3. AABB intersection fallback (no Physics Asset required)
+	//   1. Channel trace (fast, uses the Physics Asset bodies). If it blocks on
+	//      something else (capsule, accessory), that actor's skinned meshes are
+	//      polygon-traced, and nothing behind the blocking hit is considered.
+	//   2. Polygon-precise fallback against the CPU-skinned triangles of every
+	//      skinned mesh (no Physics Asset required). Packaged builds need
+	//      "Allow CPU Access" on the mesh LOD for this path.
 
 	// One-shot puni via world-space line trace. Returns true when a dent fired.
 	UFUNCTION(BlueprintCallable, Category="MilkyBody",
@@ -157,7 +167,7 @@ public:
 	// puni dents wander across the surface within ScatterRadius around the
 	// grab point. Continues until EndKneading is called.
 
-	// Begin kneading at WorldLocation. Cancels any single hold puni in flight.
+	// Begin kneading at WorldLocation. Layers on top of any other puni in flight.
 	UFUNCTION(BlueprintCallable, Category="MilkyBody",
 		meta=(AdvancedDisplay="NumPoints,ScatterRadius,MotionSpeed,RandomSeed"))
 	static void BeginKneading(
@@ -195,7 +205,7 @@ public:
 	// surface tangent plane with per-point speed jitter and depth pulsing
 	// for a realistic hand-massage feel. Continues until EndMomi is called.
 
-	// Begin momi at WorldLocation. Cancels any hold puni or kneading in flight.
+	// Begin momi at WorldLocation. Layers on top of any other puni in flight.
 	UFUNCTION(BlueprintCallable, Category="MilkyBody",
 		meta=(AdvancedDisplay="NumPoints,OrbitRadius,OrbitSpeed,SpeedVariation,DepthVariation,RandomSeed"))
 	static void BeginMomi(
@@ -230,4 +240,27 @@ public:
 		float RandomSeed = 0.0f,
 		ECollisionChannel TraceChannel = ECC_Visibility,
 		bool bEnableDebug = false);
+
+	// ── State queries / release helpers ──────────────────────────────────────
+
+	// Largest current push amount on the mesh (0 = idle, ~1 = full depth). Useful
+	// for driving sounds, blush materials or camera shake from the dent.
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category="MilkyBody")
+	static float GetPuniAmount(USkinnedMeshComponent* MeshComp);
+
+	// True while any puni on the mesh is being pressed (hold, one-shot, kneading,
+	// momi or a BoneSpherePuni fingertip). False once everything is fading out.
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category="MilkyBody")
+	static bool IsPuniActive(USkinnedMeshComponent* MeshComp);
+
+	// Release every puni on the mesh (hold, one-shots, kneading, momi, fingertips).
+	// FadeOutSeconds <= 0 resets instantly. Fingertips that still touch the body
+	// press again on the next frame.
+	UFUNCTION(BlueprintCallable, Category="MilkyBody")
+	static void ReleaseAllPuni(USkinnedMeshComponent* MeshComp, float FadeOutSeconds = 0.3f);
+
+	// ReleaseAllPuni on every MilkyBody mesh in the world. Handy on input release
+	// when the hold's mesh reference was lost (e.g. the cursor left the mesh).
+	UFUNCTION(BlueprintCallable, Category="MilkyBody", meta=(WorldContext="WorldContextObject"))
+	static void ReleaseAllPuniInWorld(UObject* WorldContextObject, float FadeOutSeconds = 0.3f);
 };

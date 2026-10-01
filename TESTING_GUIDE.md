@@ -1,114 +1,68 @@
-# MilkyBody Plugin テスト方法
+# MilkyBody テストガイド
 
-## セットアップ
+2026-10 のデバッグ＆機能追加の確認用チェックリストです。変更点は `docs/PLAN_2026-10-01.md` を参照してください。
 
-### 1. エディタで MilkyBody デフォーマーを適用
+## 0. ビルド
 
-#### 対象メッシュ: Mannequin SkeletalMesh
-- **場所**: `Content/Characters/Mannequins/Meshes/SK_Mannequin`
+- [ ] エディタターゲットがビルドできる（警告も確認する）
+- [ ] 起動時にシェーダーのコンパイルエラーが出ない（`MilkyBodySkin.usf`）
+- [ ] パッケージビルド（Development）が通る
 
-#### デフォーマー作成手順:
+ビルドで落ちたら、エラーログをそのまま共有してください。この変更はエンジン無しの環境で書いたので、API 名の差異で落ちる可能性があります。
 
-1. **MilkyBodyDeformer アセット作成**
-   - コンテンツブラウザで右クリック
-   - `その他` → `データアセット`
-   - クラス: `MilkyBodyDeformer` を選択
-   - 名前: `DA_MilkyBodyDeformer` で保存
+## 1. 既存挙動の回帰
 
-2. **デフォーマー設定**
-   - ダブルクリックで詳細パネルを開く
-   - **VertexIndexStart**: `0` (胸部頂点の開始インデックス)
-   - **VertexIndexEnd**: `500` (デモ用に前半の頂点範囲)
-   - **Stiffness**: `0.8` (アニメーション位置への引き戻し強度)
-   - **Damping**: `0.1` (速度減衰)
-   - **SolverIterations**: `4` (Verlet 積分反復回数)
-   - **GlobalBlendWeight**: `1.0`
+- [ ] デフォーマを割り当てたメッシュが、普通にアニメーションする（崩れない・消えない）
+- [ ] `milkybody.Enable 0` / `1` を切り替えても、見た目がほぼ同じ（凹みが無いとき）
+- [ ] エディタビューポート・アセットプレビューでクラッシュしない
+- [ ] `Apply Puni Under Cursor` で凹む
+- [ ] `Set Hold Puni Under Cursor`（毎フレーム）で凹む。ドラッグすると皮膚が引っ張られる
+- [ ] こね（Kneading）・揉み（Momi）が動き、End で戻る
 
-3. **Mannequin に適用**
-   - DefaultLevel を開く
-   - Outliner で `SK_Mannequin_C` (キャラクター)を選択
-   - 詳細パネルで `Skeletal Mesh Component` を探す
-   - `Mesh Deformer` セクションで:
-     - `Enabled`: チェック ON
-     - `Deformer`: `DA_MilkyBodyDeformer` を設定
+## 2. バグ修正の確認
 
-### 2. エディタで実行
+| # | 手順 | 期待結果 |
+|---|------|----------|
+| A1 | Damping を 0.6〜1.0 にしてホールドする | 発散しない（メッシュが飛ばない）。揺れずに収まる |
+| A2 | `t.MaxFPS 30` と `t.MaxFPS 144` で同じ操作をする | 凹み・戻り・揉みの速さが同じ |
+| A4 | `Apply Puni` を DurationSeconds=0.3 で呼ぶ | PushDepth の深さまで押され、0.3 秒保持してから戻る。0 にすると旧来のキック |
+| A5 | キャラの Scale を 2 にして凹ませる | 凹みの半径と深さがワールド単位で Scale=1 のときと同じ |
+| B1 | 指を 2 本重ねて押す | 重なった部分が歪まない（指の順番で見た目が変わらない） |
+| B3 | Enable Debug Draw を ON にして操作する | クラッシュせず、色分けされた球が出る |
+| B4 | パッケージ版で、Allow CPU Access が OFF のメッシュにポリゴントレースする | クラッシュせず、ログに警告が 1 回だけ出る |
+| B5 | ホールド中にカーソルをメッシュの外へ出す | 約 0.15 秒後に凹みが戻る |
+| B6 | Physics Asset の無いメッシュの近くの空中をクリックする | 凹まない。メッシュ表面をクリックすると、その位置が正確に凹む |
+| — | アニメーションしていない（静止ポーズの）メッシュをホールドする | 凹みのバネがちゃんと動く（固まらない） |
 
-1. **Play ボタン**で動作確認
-2. キャラクターが上下に揺れるアニメーションを再生
-3. **予期される動作**:
-   - 指定した頂点範囲が Verlet 物理で変形
-   - 重力（下向き）による自然な揺れ
-   - Stiffness でアニメーション位置に引き戻される
-   - Damping で速度が減衰
+## 3. 新機能の確認
 
-## トラブルシューティング
+### F3 同時インタラクション
+- [ ] ホールドしながら `Apply Puni` を連打する → 両方とも見える
+- [ ] 揉みながら指コライダーで触る → 両方とも効く
+- [ ] BoneSpherePuni を 2 つ（両手）で同じ体を触る → 両手とも凹む
 
-### エディタが起動しない場合
-```bash
-# Build を再実行
-"J:/UE_5.7/Engine/Build/BatchFiles/Build.bat" MilkemistEditor Win64 Development -Project="J:/Milkemist_plane/Milkemist/Milkemist.uproject" -WaitMutex
-```
+### F1 指ごとのフェード
+- [ ] 5 本の指で触れてから 1 本ずつ離す → 離した指の凹みだけが、なめらかに戻る
 
-### コンピュートシェーダーエラーが出る場合
-- エディタのログを確認: `Saved/Logs/Milkemist.log`
-- `RegisterShaders` が実行されたか確認
-- GPU が SM5.0 以上に対応しているか確認
+### F2 食い込み連動
+- [ ] 指をゆっくり近づけて押し込む → 触れた瞬間は浅く、押すほど深くなる（上限は ImpulseDepth）
+- [ ] `bDepthFromPenetration` を OFF にする → 常に一定の深さになる（旧挙動）
+- [ ] 肌が指に追従しないときは、`PenetrationDepthScale` を `1 / GeometryDepthScale` 程度にしてみる
 
-### 頂点変形が見えない場合
-1. **VertexIndexStart/End の確認**
-   - Mannequin メッシュで実際の頂点範囲を調査
-   - 胸部領域: 通常 500～2000 インデックス
-   
-2. **アニメーション確認**
-   - キャラクターのアニメーションが実行されているか確認
-   - 静止している場合は Stiffness で全頂点が引き戻されるだけ
+### F4 マスク
+- [ ] `BoneSoftness` に `head`（Softness 0、Include Children ON）を入れる → 顔だけ凹まない
+- [ ] `DefaultBoneSoftness`=0 にして、胸のボーンだけ 1 にする → 胸だけ凹む
+- [ ] 頂点カラーを塗ったメッシュで `VertexColorMaskChannel` を設定する → 黒い所が凹まない。Invert で反転する
+- [ ] 頂点カラーの無いメッシュでチャンネルを設定する → ログに警告が出て、マスクは無視される
 
-3. **Blend Weight 確認**
-   - `GlobalBlendWeight = 1.0` であることを確認
+### F5 / F9 ユーティリティ
+- [ ] `Get Puni Amount` が押し込みに合わせて 0→1→0 と変化する
+- [ ] `Is Puni Active` が、押している間だけ true になる
+- [ ] `Release All Puni In World` で全部戻る
+- [ ] `milkybody.DebugDraw 1` で全デバッグ表示が出る
+- [ ] `stat MilkyBody` で各項目の時間が出る
+- [ ] `ProfileGPU` に「MilkyBody」スコープが出る
 
-## 期待される視覚効果
+## 4. パフォーマンスの目安
 
-### Stiffness が有効な場合 (0.0 ～ 1.0)
-- 小（0.0-0.2）: フワフワと揺れる（柔らかい素材）
-- 中（0.4-0.6）: 適度な復帰力（標準）
-- 大（0.8-1.0）: 素早く元に戻る（硬い素材）
-
-### Damping が有効な場合 (0.0 ～ 1.0)
-- 小（0.0-0.2）: 長く振動する
-- 中（0.4-0.6）: 自然な減衰
-- 大（0.8-1.0）: すぐに停止
-
-### Solver Iterations (1-16)
-- 少ない（1-2）: 計算が軽いが不安定
-- 標準（4-6）: バランス型
-- 多い（8-16）: より安定するが計算重くなる
-
-## パフォーマンス計測
-
-VertexCount が大きい場合の FPS 低下を測定:
-
-```
-表示中:
-- VertexIndexEnd: 100   → ほぼ無視できる負荷
-- VertexIndexEnd: 500   → 軽微な負荷
-- VertexIndexEnd: 2000  → 計測可能な負荷
-
-GPU コンピュートシェーダーのため、高速処理が期待できます。
-```
-
-## 次のステップ
-
-### Phase 5 (制約・法線更新)
-1. 隣接頂点間の距離制約を追加
-2. 変形メッシュの法線を再計算
-3. マテリアルで陰影変化を表現
-
-### カスタマイズ
-- 異なるメッシュ（キャラのバスト領域など）に適用
-- リアルタイムパラメータ調整 UI を追加
-- コリジョン（指タッチ）との連携
-
----
-
-質問やエラーが発生した場合はログを確認してください。
+- [ ] `stat MilkyBody` の **CPU Skinning** を確認する。Physics Asset の無いメッシュをホールドしたり、指の表面スナップを使ったりすると、毎フレーム発生します。重い場合は Physics Asset を用意するか、`bSurfaceSnap` を OFF にしてください。

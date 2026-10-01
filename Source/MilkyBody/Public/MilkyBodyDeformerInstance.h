@@ -2,21 +2,115 @@
 
 #include "CoreMinimal.h"
 #include "Animation/MeshDeformerInstance.h"
-#include "RenderResource.h"
+#include "HAL/CriticalSection.h"
+#include "Tickable.h"
 #include "MilkyBodyDeformerInstance.generated.h"
 
 class UMilkyBodyDeformer;
 class UMeshComponent;
-class FSkeletalMeshObject;
-class FSkeletalMeshLODRenderData;
-class FRHICommandListBase;
+class USkinnedMeshComponent;
+
+namespace MilkyBody
+{
+	// Damped spring driving a contact's push amount (0 = released, 1 = full depth).
+	// Integrated with fixed sub-steps so it stays stable for every Stiffness /
+	// Damping combination the asset allows, independent of frame rate.
+	struct FPuniSpring
+	{
+		float Amount = 0.0f;
+		float Velocity = 0.0f;
+		float Target = 0.0f;
+
+		void Step(float DeltaSeconds, float SpringK, float SpringC);
+		void SnapToZero() { Amount = 0.0f; Velocity = 0.0f; Target = 0.0f; }
+		bool IsSettled() const;
+	};
+
+	// One-shot dent from ApplyPuni: presses for DurationSeconds, then springs back.
+	struct FImpulseContact
+	{
+		FVector3f LocalPos = FVector3f::ZeroVector;
+		FVector3f LocalImpulse = FVector3f::ZeroVector;
+		float LocalRadius = 0.0f;
+		double ReleaseTime = 0.0;
+		FPuniSpring Spring;
+	};
+
+	// Caller-driven contact (e.g. a fingertip). Refreshed every frame by its
+	// source; fades out on its own spring once the source stops updating it.
+	struct FExternalContact
+	{
+		FVector3f LocalPos = FVector3f::ZeroVector;
+		FVector3f LocalImpulse = FVector3f::ZeroVector;
+		float LocalRadius = 0.0f;
+		uint64 LastUpdateFrame = 0;
+		FPuniSpring Spring;
+	};
+
+	struct FHoldState
+	{
+		bool bHeld = false;
+		FVector3f AnchorLocalPos = FVector3f::ZeroVector;
+		FVector3f AnchorLocalImpulse = FVector3f::ZeroVector;
+		FVector3f CurrentLocalOffset = FVector3f::ZeroVector;
+		FVector3f TargetLocalOffset = FVector3f::ZeroVector;
+		float LocalRadius = 0.0f;
+		double LastRefreshTime = 0.0;
+		FPuniSpring Spring;
+	};
+
+	struct FKneadingState
+	{
+		bool bActive = false; // stays true while fading so the motion continues
+		int32 NumPoints = 0;
+		float LocalScatterRadius = 0.0f;
+		float MotionSpeed = 0.0f;
+		float Time = 0.0f;
+		float Seed = 0.0f;
+		float LocalEachRadius = 0.0f;
+		FVector3f CenterLocal = FVector3f::ZeroVector;
+		FVector3f ImpulseLocal = FVector3f::ZeroVector;
+		FVector3f TangentU = FVector3f(1, 0, 0); // basis perpendicular to the impulse, used to
+		FVector3f TangentV = FVector3f(0, 1, 0); // scatter fingers across the touched surface
+		FPuniSpring Spring;
+	};
+
+	struct FMomiState
+	{
+		bool bActive = false;
+		int32 NumPoints = 0;
+		float LocalOrbitRadius = 0.0f;
+		float OrbitSpeed = 0.0f;
+		float SpeedVariation = 0.0f; // 0..1 fraction of speed randomness
+		float DepthVariation = 0.0f; // 0..1 fraction of impulse depth pulsing
+		float Time = 0.0f;
+		float Seed = 0.0f;
+		float LocalEachRadius = 0.0f;
+		FVector3f CenterLocal = FVector3f::ZeroVector;
+		FVector3f ImpulseLocal = FVector3f::ZeroVector;
+		FVector3f TangentU = FVector3f(1, 0, 0);
+		FVector3f TangentV = FVector3f(0, 1, 0);
+		FPuniSpring Spring;
+	};
+
+	struct FSoftnessCache
+	{
+		const void* SkinnedAsset = nullptr;
+		int32 LODIndex = INDEX_NONE;
+		uint32 SettingsHash = 0;
+		bool bUseBoneSoftness = false;
+		// Shared with in-flight render commands; replaced (never mutated) on change.
+		TSharedPtr<const TArray<TArray<FVector4f>>, ESPMode::ThreadSafe> PerSection;
+	};
+}
 
 UCLASS()
-class MILKYBODY_API UMilkyBodyDeformerInstance : public UMeshDeformerInstance
+class MILKYBODY_API UMilkyBodyDeformerInstance : public UMeshDeformerInstance, public FTickableGameObject
 {
 	GENERATED_BODY()
 
 public:
+	// --- UMeshDeformerInstance ---
 	virtual void AllocateResources() override;
 	virtual void ReleaseResources() override;
 	virtual void EnqueueWork(const FEnqueueWorkDesc& InDesc) override;
@@ -27,25 +121,43 @@ public:
 	virtual bool RequestReadbackDeformerGeometry(TUniquePtr<FMeshDeformerGeometryReadbackRequest> InRequest) override;
 #endif
 
+	// --- FTickableGameObject ---
+	// The spring simulation runs here on the game thread (after all actor
+	// ticks, before end-of-frame render updates) so it is frame-rate
+	// independent and can safely draw debug shapes and mark the component's
+	// render data dirty while a dent is moving.
+	virtual void Tick(float DeltaTime) override;
+	virtual bool IsTickable() const override;
+	virtual ETickableTickType GetTickableTickType() const override { return ETickableTickType::Conditional; }
+	virtual UWorld* GetTickableGameObjectWorld() const override;
+	virtual bool IsTickableInEditor() const override { return false; }
+	virtual bool IsTickableWhenPaused() const override { return false; }
+	virtual TStatId GetStatId() const override;
+
 public:
 	// Set the deformer asset when instance is created
 	void SetDeformerAsset(UMilkyBodyDeformer* InDeformer) { DeformerAsset = InDeformer; }
 	void SetMeshComponent(UMeshComponent* InComponent) { MeshComponent = InComponent; }
 
-	// Apply a transient "puni" dent around WorldLocation, pushing particles along WorldImpulse
-	// (direction * distance in cm). Lasts for DurationSeconds, linearly fading out.
+	// All interaction channels below are independent and layer additively, so
+	// e.g. a cursor hold, a one-shot tap and fingertip contacts can deform the
+	// same mesh at the same time. Radii and impulses are world-space (cm).
+
+	// One-shot dent: presses toward WorldImpulse (direction × depth) for
+	// DurationSeconds, then springs back. DurationSeconds <= 0 gives a short
+	// velocity "kick" instead. Up to 4 one-shots run at once (oldest dropped).
 	void ApplyPushImpulse(const FVector& WorldLocation, const FVector& WorldImpulse, float Radius, float DurationSeconds);
 
-	// Hold-style dent: stays at full strength until ReleaseHold is called. Call each frame
-	// to keep the dent centered on a moving location. Cancels any in-flight one-shot fade.
+	// Hold-style dent: call every frame while held. The first call anchors the
+	// dent; later calls drag the skin toward the new location. Auto-releases
+	// after UMilkyBodyDeformer::HoldAutoReleaseSeconds without a refresh.
 	void BeginHoldPush(const FVector& WorldLocation, const FVector& WorldImpulse, float Radius);
 
-	// Release a held push and start a fade-out over FadeOutSeconds (0 = instant).
+	// Release the hold (FadeOutSeconds <= 0 = instant, otherwise spring back).
 	void ReleaseHoldPush(float FadeOutSeconds);
 
-	// Kneading: simulates a hand grabbing and kneading the body. Spawns up to
-	// 3 animated puni dents wandering inside ScatterRadius around WorldLocation.
-	// Mutually exclusive with the single hold push.
+	// Kneading: up to 4 animated dents wandering inside ScatterRadius around
+	// WorldLocation until EndKneading is called.
 	void BeginKneading(
 		const FVector& WorldLocation,
 		const FVector& WorldImpulse,
@@ -55,13 +167,11 @@ public:
 		float MotionSpeed,
 		float RandomSeed);
 
-	// Stop kneading; fades out alongside the push amount spring.
+	// Stop kneading; the dents keep moving while they fade out.
 	void EndKneading();
 
-	// Momi (揉み): Circular kneading motion that simulates hands grabbing
-	// and massaging in a circular orbit. Each point orbits around the grab
-	// center with slight speed variation and radius wobble for realism.
-	// Mutually exclusive with hold push and linear kneading.
+	// Momi (揉み): up to 4 dents orbiting the grab center with per-point speed
+	// jitter and depth pulsing until EndMomi is called.
 	void BeginMomi(
 		const FVector& WorldLocation,
 		const FVector& WorldImpulse,
@@ -73,82 +183,88 @@ public:
 		float DepthVariation,
 		float RandomSeed);
 
-	// Stop momi; fades out alongside the push amount spring.
+	// Stop momi; the dents keep orbiting while they fade out.
 	void EndMomi();
 
-	// External multi-hold: caller supplies N world-space sphere centers + radii
-	// each frame (e.g. fingertip bones snapped to the body surface). Each slot
-	// gets its own per-slot impulse vector (typically inward along the local
-	// surface normal). Mutually exclusive with single hold / kneading / momi.
-	// Locations.Num() must equal Radii.Num() and Impulses.Num(); excess beyond
-	// MaxPuniSlots is clamped.
-	void BeginExternalMultiHold(
+	// External contacts (e.g. fingertip spheres). Call every frame with the
+	// contacts currently touching. Source identifies the caller so several
+	// drivers (two hands) can touch the same mesh; ContactIds must be stable per
+	// finger across frames. Contacts of this Source missing from the call (or
+	// not refreshed this frame) fade out individually on their own spring.
+	// All arrays must have the same length.
+	void UpdateExternalContacts(
+		const UObject* Source,
+		const TArray<int32>& ContactIds,
 		const TArray<FVector>& WorldLocations,
 		const TArray<float>& Radii,
 		const TArray<FVector>& WorldImpulses);
 
-	// Stop external multi-hold; fades out alongside the push amount spring.
+	// Fade out every external contact supplied by Source.
+	void ReleaseExternalContacts(const UObject* Source);
+
+	// Legacy single-source wrappers around UpdateExternalContacts / ReleaseExternalContacts.
+	void BeginExternalMultiHold(
+		const TArray<FVector>& WorldLocations,
+		const TArray<float>& Radii,
+		const TArray<FVector>& WorldImpulses);
 	void EndExternalMultiHold();
 
+	// Release every channel (hold, one-shots, kneading, momi, external contacts).
+	void ReleaseAll(float FadeOutSeconds);
+
+	// Largest current push amount across all contacts (0 = idle, ~1 = full depth;
+	// may briefly exceed 1 or go negative while the spring overshoots).
+	float GetPuniAmount() const;
+
+	// True while any contact is being pressed (not merely fading out).
+	bool IsPuniActive() const;
+
 private:
+	UPROPERTY()
 	TObjectPtr<UMilkyBodyDeformer> DeformerAsset;
+
 	TWeakObjectPtr<UMeshComponent> MeshComponent;
 
-	// --- Puni push state ---
-	// Anchor: dent center (and impulse) captured the frame the hold began (or
-	// on a one-shot impulse). Stays fixed for the lifetime of a hold so the
-	// dent doesn't teleport when the cursor moves.
-	// Effective dent center = AnchorLocalPos + CurrentLocalOffset, where
-	// CurrentLocalOffset smooths toward TargetLocalOffset using
-	// UMilkyBodyDeformer::HoldFollowSmoothing and is clamped to a fraction of
-	// PushRadius (HoldMaxFollowOffsetRatio).
-	FVector3f AnchorLocalPos = FVector3f::ZeroVector;
-	FVector3f AnchorLocalImpulse = FVector3f::ZeroVector;
-	FVector3f CurrentLocalOffset = FVector3f::ZeroVector;
-	FVector3f TargetLocalOffset = FVector3f::ZeroVector;
-	float PushRadius = 0.0f;
-	float CurrentPushAmount = 0.0f;
-	float PushVelocity = 0.0f;
-	float TargetPushAmount = 0.0f;
-	bool bPushHeld = false;
+	USkinnedMeshComponent* GetSkinnedComponent() const;
+	bool HasAnyContact() const;
+	void BuildSlots(const FTransform& ComponentToWorld, bool bDebugDraw, UWorld* DebugWorld);
 
-	// --- Kneading state ---
-	// When active, slots 0..NumKneadingPoints-1 are driven procedurally each
-	// frame in EnqueueWork (sin/cos wandering on the impulse-tangent plane),
-	// replacing the single hold dispatch.
-	bool bKneading = false;
-	int32 NumKneadingPoints = 0;
-	float KneadingScatterRadius = 0.0f;
-	float KneadingMotionSpeed = 0.0f;
-	float KneadingTime = 0.0f;
-	float KneadingSeed = 0.0f;
-	FVector3f KneadCenterLocal = FVector3f::ZeroVector;
-	FVector3f KneadImpulseLocal = FVector3f::ZeroVector;
-	FVector3f KneadTangentU = FVector3f(1, 0, 0);  // basis vectors perpendicular to KneadImpulseLocal,
-	FVector3f KneadTangentV = FVector3f(0, 1, 0);  // used to scatter fingers across the touched surface
-	float KneadEachRadius = 0.0f;
+	// Game-time clock advanced in Tick. Used for one-shot durations and hold
+	// auto-release so both respect pause and time dilation.
+	double SimTime = 0.0;
 
-	// --- Momi (揉み) state ---
-	// Circular orbit kneading. Each point traces an elliptical orbit around
-	// the grab center on the tangent plane, with per-point speed jitter and
-	// depth pulsing for a realistic hand-massage feel.
-	bool bMomi = false;
-	int32 NumMomiPoints = 0;
-	float MomiOrbitRadius = 0.0f;
-	float MomiOrbitSpeed = 0.0f;
-	float MomiSpeedVariation = 0.0f;   // 0..1 fraction of speed randomness
-	float MomiDepthVariation = 0.0f;   // 0..1 fraction of impulse depth pulsing
-	float MomiTime = 0.0f;
-	float MomiSeed = 0.0f;
-	FVector3f MomiCenterLocal = FVector3f::ZeroVector;
-	FVector3f MomiImpulseLocal = FVector3f::ZeroVector;
-	FVector3f MomiTangentU = FVector3f(1, 0, 0);
-	FVector3f MomiTangentV = FVector3f(0, 1, 0);
-	float MomiEachRadius = 0.0f;
+	// --- Single hold ---
+	// The anchor stays fixed for the lifetime of a hold so the dent doesn't
+	// teleport when the cursor moves; CurrentLocalOffset (smoothed toward
+	// TargetLocalOffset, clamped to a fraction of the radius) is folded into
+	// the impulse as a tangential pull.
+	MilkyBody::FHoldState Hold;
 
-	// --- External multi-hold state (per-frame supplied positions, e.g. fingertips) ---
-	bool bExternalMultiHold = false;
-	TArray<FVector3f> ExternalLocalPositions;
-	TArray<FVector3f> ExternalLocalImpulses;
-	TArray<float> ExternalRadii;
+	// --- One-shot impulses ---
+	TArray<MilkyBody::FImpulseContact> Impulses;
+
+	// --- Kneading ---
+	MilkyBody::FKneadingState Kneading;
+
+	// --- Momi (揉み) ---
+	MilkyBody::FMomiState Momi;
+
+	// --- External contacts, keyed by (source unique id << 32 | contact id) ---
+	TMap<uint64, MilkyBody::FExternalContact> ExternalContacts;
+
+	// --- Slots handed to the GPU (component space, push amount applied) ---
+	// Written in Tick, read in EnqueueWork (which may run on a worker thread
+	// during end-of-frame updates), hence the lock.
+	FCriticalSection PendingSlotsLock;
+	TArray<FVector4f> PendingPosAndRadius;
+	TArray<FVector4f> PendingImpulse;
+	// One extra dispatch after everything settles so the mesh returns cleanly.
+	bool bSlotsActiveLastTick = false;
+
+	// --- Bone softness cache (per section fake bone matrices) ---
+	MilkyBody::FSoftnessCache SoftnessCache;
+
+	void UpdateSoftnessCache(USkinnedMeshComponent* SkinnedComp, int32 LODIndex);
+
+	bool bWarnedNoVertexColors = false;
 };
